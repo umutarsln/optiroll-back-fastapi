@@ -1,1 +1,4 @@
 /sonuclar
+.env
+*.env
+!.env.example
