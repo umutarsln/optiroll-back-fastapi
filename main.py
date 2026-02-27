@@ -42,10 +42,14 @@ from supabase_client import (
 
 app = FastAPI(title="Kesme Stoku Optimizasyon API")
 
-# CORS ayarları
+# CORS ayarları: lokal ve production frontend origin'lerini izinli yap
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://3d-web-iduh-4os6uvukk-umuts-projects-ef16418a.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -302,7 +306,10 @@ async def optimize(request: OptimizeRequest):
             logger.warning("[%s] %s", he.status_code, he.detail)
         raise
     except Exception as e:
-        logger.exception("Sunucu hatası: %s", str(e))
+        logger.exception(
+            "Optimize sunucu hatası: %s | orders=%s, rolls=%s",
+            str(e), len(request.orders), len(request.rollSettings.rolls or []),
+        )
         raise HTTPException(status_code=500, detail=f"Sunucu hatası: {str(e)}")
 
 
