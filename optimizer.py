@@ -1,6 +1,9 @@
 """
 Optimizasyon mantığı - Modüler fonksiyonlar
 """
+# Bu eşiğin (ton) altındaki rulo artığı stok değil fire sayılır (iş kuralı).
+MIN_STOCK_THRESHOLD_TON = 0.5
+
 import pulp
 import pandas as pd
 from openpyxl import Workbook
@@ -267,13 +270,26 @@ def solve_optimization(
             "ordersUsed": kullanilan_siparis
         })
     
-    # Özet
-    toplam_fire = sum([pulp.value(F[i]) for i in I])
-    toplam_stok = sum([pulp.value(R[i]) for i in I])
-    acilan_rulo = sum([1 for i in I if pulp.value(y[i]) > 0.5])
+    # İş kuralı: 0,5 ton altı kalan stok fire sayılır
+    toplam_fire = 0.0
+    toplam_stok = 0.0
+    for item in roll_status:
+        stok = float(item["stock"])
+        fire = float(item["fire"])
+        if stok > 0 and stok < MIN_STOCK_THRESHOLD_TON:
+            item["fire"] = round(fire + stok, 4)
+            item["stock"] = 0.0
+            fire = item["fire"]
+            stok = 0.0
+        toplam_fire += fire
+        toplam_stok += stok
     
+    acilan_rulo = sum([1 for i in I if pulp.value(y[i]) > 0.5])
+    # Fire/stok yeniden sınıflandığı için maliyeti buna göre güncelle
+    guncel_maliyet = toplam_fire * fire_cost + toplam_stok * stock_cost + acilan_rulo * setup_cost
+
     summary = {
-        "totalCost": round(pulp.value(model.objective), 2),
+        "totalCost": round(guncel_maliyet, 2),
         "totalFire": round(toplam_fire, 4),
         "totalStock": round(toplam_stok, 4),
         "openedRolls": acilan_rulo
