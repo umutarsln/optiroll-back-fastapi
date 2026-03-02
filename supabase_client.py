@@ -21,8 +21,8 @@ def get_supabase_client():
     if _client is not None:
         return _client
 
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
+    url = (os.getenv("SUPABASE_URL") or "").strip()
+    key = (os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY") or "").strip()
 
     if not url or not key:
         logger.info("Supabase bağlantısı atlandı: SUPABASE_URL veya SUPABASE_KEY tanımlı değil")
@@ -36,7 +36,13 @@ def get_supabase_client():
         logger.warning("supabase paketi yüklü değil. pip install supabase")
         return None
     except Exception as e:
-        logger.exception("Supabase bağlantı hatası: %s", str(e))
+        err_msg = str(e)
+        if "Invalid API key" in err_msg or "API key" in err_msg:
+            logger.error(
+                "Supabase API anahtarı geçersiz. Lütfen Supabase Dashboard > Project Settings > API "
+                "bölümünden 'service_role' (secret) anahtarını kopyalayın. 'anon' (public) anahtarı backend için kullanılmamalı."
+            )
+        logger.exception("Supabase bağlantı hatası: %s", err_msg)
         return None
 
 
