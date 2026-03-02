@@ -48,6 +48,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "https://www.optiroll.pro",
+        "https://optiroll.pro",
         "https://3d-web-iduh-4os6uvukk-umuts-projects-ef16418a.vercel.app",
     ],
     allow_credentials=True,
