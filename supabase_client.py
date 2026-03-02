@@ -22,10 +22,21 @@ def get_supabase_client():
         return _client
 
     url = (os.getenv("SUPABASE_URL") or "").strip()
-    key = (os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY") or "").strip()
+    service_key = (os.getenv("SUPABASE_SERVICE_KEY") or "").strip()
+    fallback_key = (os.getenv("SUPABASE_KEY") or "").strip()
+    key = service_key or fallback_key
+    key_source = "SUPABASE_SERVICE_KEY" if service_key else ("SUPABASE_KEY" if fallback_key else "")
 
     if not url or not key:
         logger.info("Supabase bağlantısı atlandı: SUPABASE_URL veya SUPABASE_KEY tanımlı değil")
+        return None
+
+    # Backend için sadece secret key kullanılmalı; publishable key "Invalid API key" verir
+    if key.startswith("sb_publishable_"):
+        logger.error(
+            "Backend için publishable key kullanılıyor (SUPABASE_KEY?). Railway/ortamda SUPABASE_SERVICE_KEY "
+            "değişkenine secret key (sb_secret_...) atayın. Publishable key sadece tarayıcı için."
+        )
         return None
 
     try:
@@ -39,8 +50,10 @@ def get_supabase_client():
         err_msg = str(e)
         if "Invalid API key" in err_msg or "API key" in err_msg:
             logger.error(
-                "Supabase API anahtarı geçersiz. Lütfen Supabase Dashboard > Project Settings > API "
-                "bölümünden 'service_role' (secret) anahtarını kopyalayın. 'anon' (public) anahtarı backend için kullanılmamalı."
+                "Supabase API anahtarı geçersiz (kullanılan kaynak: %s, key sb_secret_ ile başlıyor mu: %s). "
+                "Railway'de SUPABASE_SERVICE_KEY ortam değişkeninin secret key olduğundan emin olun.",
+                key_source,
+                key.startswith("sb_secret_"),
             )
         logger.exception("Supabase bağlantı hatası: %s", err_msg)
         return None
