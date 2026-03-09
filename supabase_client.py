@@ -193,6 +193,7 @@ def save_optimization_result(
     cutting_plan: List[Dict],
     roll_status: List[Dict],
     configuration_id: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> Optional[str]:
     """
     Optimizasyon sonucunu Supabase'e kaydeder.
@@ -204,6 +205,7 @@ def save_optimization_result(
         cutting_plan: Kesim planı listesi
         roll_status: Rulo durumları listesi
         configuration_id: İlişkili kayıtlı konfigürasyon ID (opsiyonel)
+        description: Kısa açıklama (sonuçlar tablosunda gösterilir, opsiyonel)
 
     Returns:
         Kaydedilen run_id (UUID) veya None
@@ -214,7 +216,8 @@ def save_optimization_result(
 
     try:
         run_status = str(summary.get("status", "Optimal")) if isinstance(summary, dict) else "Optimal"
-        # Ana kayıt
+        desc_trimmed = (description or "").strip()[:500] if description else None
+        # Ana kayıt (status: solver durumu, run_status: saved/processed/cancelled)
         run_row = {
             "file_id": file_id,
             "configuration_id": configuration_id,
@@ -223,7 +226,10 @@ def save_optimization_result(
             "cutting_plan": cutting_plan,
             "roll_status": roll_status,
             "status": run_status,
+            "run_status": "saved",
         }
+        if desc_trimmed is not None:
+            run_row["description"] = desc_trimmed
         resp = client.table("optimization_runs").insert(run_row).execute()
         if resp.data and len(resp.data) > 0:
             run_id = str(resp.data[0].get("id"))
@@ -433,7 +439,7 @@ def list_runs(limit: int = 50, offset: int = 0) -> List[Dict]:
     try:
         resp = (
             client.table("optimization_runs")
-            .select("id, file_id, created_at, summary, status")
+            .select("id, file_id, created_at, summary, status, run_status, processed_at, description")
             .order("created_at", desc=True)
             .range(offset, offset + limit - 1)
             .execute()
@@ -461,162 +467,342 @@ def get_run_by_file_id(file_id: str) -> Optional[Dict]:
     return None
 
 
-def list_order_sets() -> List[Dict]:
+def list_orders(status_filter: Optional[str] = None) -> List[Dict]:
     """
-    Kayıtlı sipariş setlerini listeler.
+    Kayıtlı siparişleri listeler.
+
+    Args:
+        status_filter: Opsiyonel durum filtresi (örn. 'Pending')
 
     Returns:
-        Sipariş seti satırları
+        Sipariş satırları
+    """
+    client = get_supabase_client()
+    if not client:
+        return []
+    try:
+        query = client.table("orders").select("*").order("created_at", desc=True)
+        if status_filter:
+            query = query.eq("status", status_filter)
+        resp = query.execute()
+        return resp.data or []
+    except Exception as e:
+        logger.exception("Siparişler listelenemedi: %s", str(e))
+        return []
+
+
+def save_order(
+    *,
+    order_id: Optional[str] = None,
+    m2: float,
+    panel_width: float,
+    panel_length: float = 1.0,
+    il: Optional[str] = None,
+    bitis_tarihi: Optional[str] = None,
+    aciklama: Optional[str] = None,
+    status: str = "Pending",
+    id: Optional[str] = None,
+) -> Optional[Dict]:
+    """
+    Sipariş kaydeder veya günceller.
+
+    Args:
+        order_id: Kullanıcı dostu ID (opsiyonel)
+        m2: Talep m²
+        panel_width: Panel genişliği (m)
+        panel_length: Panel kesim uzunluğu (m)
+        il: İl (opsiyonel)
+        bitis_tarihi: Bitiş tarihi ISO format (opsiyonel)
+        aciklama: Açıklama (opsiyonel)
+        status: Durum (Pending, Optimized, In Production)
+        id: Güncellenecek sipariş UUID (opsiyonel)
+
+    Returns:
+        Kaydedilen sipariş satırı veya None
+    """
+    client = get_supabase_client()
+    if not client:
+        return None
+    try:
+        row = {
+            "order_id": order_id,
+            "m2": float(m2),
+            "panel_width": float(panel_width),
+            "panel_length": float(panel_length),
+            "il": il,
+            "bitis_tarihi": bitis_tarihi,
+            "aciklama": aciklama,
+            "status": status,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if id:
+            resp = client.table("orders").update(row).eq("id", id).execute()
+            if resp.data and len(resp.data) > 0:
+                return resp.data[0]
+            return None
+        row.pop("updated_at", None)
+        resp = client.table("orders").insert(row).execute()
+        if resp.data and len(resp.data) > 0:
+            return resp.data[0]
+        return None
+    except Exception as e:
+        logger.exception("Sipariş kaydedilemedi: %s", str(e))
+        return None
+
+
+def delete_order(order_id: str) -> bool:
+    """
+    Siparişi siler.
+
+    Args:
+        order_id: Silinecek sipariş UUID
+
+    Returns:
+        Silme başarılıysa True
+    """
+    client = get_supabase_client()
+    if not client:
+        return False
+    try:
+        client.table("orders").delete().eq("id", order_id).execute()
+        return True
+    except Exception as e:
+        logger.exception("Sipariş silinemedi: %s", str(e))
+        return False
+
+
+def list_stock_rolls() -> List[Dict]:
+    """
+    Kayıtlı stok rulolarını listeler.
+
+    Returns:
+        Rulo satırları
     """
     client = get_supabase_client()
     if not client:
         return []
     try:
         resp = (
-            client.table("order_sets")
+            client.table("stock_rolls")
             .select("*")
-            .order("updated_at", desc=True)
+            .order("created_at", desc=True)
             .execute()
         )
         return resp.data or []
     except Exception as e:
-        logger.exception("Sipariş setleri listelenemedi: %s", str(e))
+        logger.exception("Stok ruloları listelenemedi: %s", str(e))
         return []
+
+
+def add_stock_roll(tonnage: float, source: str = "manual", run_id: Optional[str] = None) -> Optional[Dict]:
+    """
+    Yeni rulo ekler.
+
+    Args:
+        tonnage: Rulo tonajı
+        source: Kaynak ('manual' | 'optimization_leftover')
+        run_id: Optimizasyondan geldiyse run UUID (opsiyonel)
+
+    Returns:
+        Eklenen rulo satırı veya None
+    """
+    client = get_supabase_client()
+    if not client:
+        return None
+    try:
+        row = {
+            "tonnage": float(tonnage),
+            "source": source,
+            "run_id": run_id,
+        }
+        resp = client.table("stock_rolls").insert(row).execute()
+        if resp.data and len(resp.data) > 0:
+            return resp.data[0]
+        return None
+    except Exception as e:
+        logger.exception("Rulo eklenemedi: %s", str(e))
+        return None
+
+
+def update_stock_roll(roll_id: str, tonnage: float) -> Optional[Dict]:
+    """
+    Rulo tonajını günceller.
+
+    Args:
+        roll_id: Güncellenecek rulo UUID
+        tonnage: Yeni tonaj (ton)
+
+    Returns:
+        Güncellenen rulo satırı veya None
+    """
+    client = get_supabase_client()
+    if not client:
+        return None
+    try:
+        resp = (
+            client.table("stock_rolls")
+            .update({"tonnage": float(tonnage)})
+            .eq("id", roll_id)
+            .execute()
+        )
+        if resp.data and len(resp.data) > 0:
+            return resp.data[0]
+        return None
+    except Exception as e:
+        logger.exception("Rulo güncellenemedi: %s", str(e))
+        return None
+
+
+def delete_stock_roll(roll_id: str) -> bool:
+    """
+    Ruloyu siler.
+
+    Args:
+        roll_id: Silinecek rulo UUID
+
+    Returns:
+        Silme başarılıysa True
+    """
+    client = get_supabase_client()
+    if not client:
+        return False
+    try:
+        client.table("stock_rolls").delete().eq("id", roll_id).execute()
+        return True
+    except Exception as e:
+        logger.exception("Rulo silinemedi: %s", str(e))
+        return False
+
+
+def process_optimization_result(file_id: str) -> bool:
+    """
+    Optimizasyon sonucunu işleme alır: kullanılan stok rulolarını stoktan düşer,
+    kalan (stock) tonajları yeni rulo olarak stoka yazar, siparişleri In Production yapar,
+    çalıştırmayı işlendi olarak işaretler.
+
+    Args:
+        file_id: Çalıştırma file_id değeri
+
+    Returns:
+        İşlem başarılıysa True
+    """
+    client = get_supabase_client()
+    if not client:
+        return False
+
+    try:
+        run = get_run_by_file_id(file_id)
+        if not run:
+            logger.warning("process_optimization_result: Run bulunamadı file_id=%s", file_id)
+            return False
+
+        input_data = run.get("input_data") or {}
+        orders_input = input_data.get("orders") or []
+        run_id = run.get("id")
+
+        # 1) Bu çalıştırmada kullanılan stok rulolarını stoktan sil (optimizasyona giren rulolar)
+        stock_roll_ids = input_data.get("stockRollIds") or []
+        for roll_id in stock_roll_ids:
+            if roll_id:
+                delete_stock_roll(roll_id)
+
+        # 2) roll_status'ta stock > 0 olan her rulo için stoka yeni rulo ekle (kalan stok)
+        roll_status = run.get("roll_status") or []
+        for item in roll_status:
+            stock_ton = float(item.get("stock", 0) or 0)
+            if stock_ton > 0:
+                add_stock_roll(tonnage=stock_ton, source="optimization_leftover", run_id=str(run_id) if run_id else None)
+
+        # 3) cutting_plan'da kullanılan sipariş indekslerini bul
+        cutting_plan = run.get("cutting_plan") or []
+        used_order_indices = {int(c.get("orderId", -1)) for c in cutting_plan if c.get("orderId") is not None}
+
+        # 4) input_data.orders'dan orderId (UUID) al ve orders tablosunu güncelle
+        for idx in used_order_indices:
+            if 0 <= idx < len(orders_input):
+                order_obj = orders_input[idx]
+                db_order_id = order_obj.get("orderId") if isinstance(order_obj, dict) else getattr(order_obj, "orderId", None)
+                if db_order_id:
+                    client.table("orders").update(
+                        {"status": "In Production", "updated_at": datetime.now(timezone.utc).isoformat()}
+                    ).eq("id", db_order_id).execute()
+
+        # 5) optimization_runs'ı işlendi olarak işaretle
+        client.table("optimization_runs").update({
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+            "run_status": "processed",
+        }).eq("file_id", file_id).execute()
+
+        logger.info("İşleme alındı: file_id=%s (stoktan %s rulo düşüldü, %s kalan rulo eklendi)",
+                    file_id, len(stock_roll_ids), sum(1 for r in roll_status if float(r.get("stock", 0) or 0) > 0))
+        return True
+    except Exception as e:
+        logger.exception("process_optimization_result hatası: %s", str(e))
+        return False
+
+
+def cancel_run(file_id: str) -> bool:
+    """
+    Optimizasyon çalıştırmasını iptal olarak işaretler (silmez).
+
+    Args:
+        file_id: Çalıştırma file_id değeri
+
+    Returns:
+        Güncelleme başarılıysa True
+    """
+    client = get_supabase_client()
+    if not client:
+        return False
+    try:
+        client.table("optimization_runs").update({
+            "run_status": "cancelled",
+        }).eq("file_id", file_id).execute()
+        logger.info("İptal edildi: file_id=%s", file_id)
+        return True
+    except Exception as e:
+        logger.exception("cancel_run hatası: %s", str(e))
+        return False
+
+
+# Eski order_sets / stock_sets fonksiyonları - geriye dönük uyumluluk (migration sonrası kaldırılabilir)
+def list_order_sets() -> List[Dict]:
+    """Eski API: order_sets tablosu kaldırıldı. Boş liste döner."""
+    return []
 
 
 def save_order_set(name: str, orders: List[Dict], set_id: Optional[str] = None) -> Optional[Dict]:
-    """
-    Sipariş seti kaydeder veya günceller.
-
-    Args:
-        name: Set adı
-        orders: Sipariş satırları
-        set_id: Güncellenecek set ID değeri (opsiyonel)
-
-    Returns:
-        Kaydedilen set satırı veya None
-    """
-    client = get_supabase_client()
-    if not client:
-        return None
-    try:
-        row = {
-            "name": name,
-            "orders": orders,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if set_id:
-            resp = client.table("order_sets").update(row).eq("id", set_id).execute()
-            if resp.data and len(resp.data) > 0:
-                return resp.data[0]
-            return None
-        resp = client.table("order_sets").insert({"name": name, "orders": orders}).execute()
-        if resp.data and len(resp.data) > 0:
-            return resp.data[0]
-        return None
-    except Exception as e:
-        logger.exception("Sipariş seti kaydedilemedi: %s", str(e))
-        return None
+    """Eski API: order_sets kaldırıldı."""
+    return None
 
 
 def delete_order_set(set_id: str) -> bool:
-    """
-    Sipariş setini siler.
-
-    Args:
-        set_id: Silinecek set ID değeri
-
-    Returns:
-        Silme başarılıysa True
-    """
-    client = get_supabase_client()
-    if not client:
-        return False
-    try:
-        client.table("order_sets").delete().eq("id", set_id).execute()
-        return True
-    except Exception as e:
-        logger.exception("Sipariş seti silinemedi: %s", str(e))
-        return False
+    """Eski API: order_sets kaldırıldı."""
+    return False
 
 
 def list_stock_sets() -> List[Dict]:
-    """
-    Kayıtlı stok/rulo setlerini listeler.
-
-    Returns:
-        Stok seti satırları
-    """
-    client = get_supabase_client()
-    if not client:
+    """Eski API: stock_sets kaldırıldı. stock_rolls'tan set benzeri gruplama yapılabilir."""
+    rolls = list_stock_rolls()
+    if not rolls:
         return []
-    try:
-        resp = (
-            client.table("stock_sets")
-            .select("*")
-            .order("updated_at", desc=True)
-            .execute()
-        )
-        return resp.data or []
-    except Exception as e:
-        logger.exception("Stok setleri listelenemedi: %s", str(e))
-        return []
+    return [{"id": "default", "name": "Mevcut Rulolar", "rolls": [float(r.get("tonnage", 0)) for r in rolls]}]
 
 
 def save_stock_set(name: str, rolls: List[float], set_id: Optional[str] = None) -> Optional[Dict]:
-    """
-    Stok/rulo seti kaydeder veya günceller.
-
-    Args:
-        name: Set adı
-        rolls: Rulo tonaj listesi
-        set_id: Güncellenecek set ID değeri (opsiyonel)
-
-    Returns:
-        Kaydedilen set satırı veya None
-    """
+    """Eski API: Her ruloyu ayrı ekler."""
     client = get_supabase_client()
     if not client:
         return None
-    try:
-        row = {
-            "name": name,
-            "rolls": rolls,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if set_id:
-            resp = client.table("stock_sets").update(row).eq("id", set_id).execute()
-            if resp.data and len(resp.data) > 0:
-                return resp.data[0]
-            return None
-        resp = client.table("stock_sets").insert({"name": name, "rolls": rolls}).execute()
-        if resp.data and len(resp.data) > 0:
-            return resp.data[0]
-        return None
-    except Exception as e:
-        logger.exception("Stok seti kaydedilemedi: %s", str(e))
-        return None
+    for ton in rolls:
+        if float(ton) > 0:
+            add_stock_roll(tonnage=float(ton), source="manual")
+    return {"id": "default", "name": name, "rolls": rolls}
 
 
 def delete_stock_set(set_id: str) -> bool:
-    """
-    Stok/rulo setini siler.
-
-    Args:
-        set_id: Silinecek set ID değeri
-
-    Returns:
-        Silme başarılıysa True
-    """
-    client = get_supabase_client()
-    if not client:
-        return False
-    try:
-        client.table("stock_sets").delete().eq("id", set_id).execute()
-        return True
-    except Exception as e:
-        logger.exception("Stok seti silinemedi: %s", str(e))
-        return False
+    """Eski API: stock_sets kaldırıldı."""
+    return False
 
 
 def delete_report_from_storage(file_id: str) -> bool:

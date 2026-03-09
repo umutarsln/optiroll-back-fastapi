@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
 import uuid
 import os
@@ -28,12 +28,15 @@ from supabase_client import (
     update_run_configuration_id,
     delete_run_by_file_id,
     delete_report_from_storage,
-    list_order_sets,
-    save_order_set,
-    delete_order_set,
-    list_stock_sets,
-    save_stock_set,
-    delete_stock_set,
+    list_orders,
+    save_order,
+    delete_order,
+    list_stock_rolls,
+    add_stock_roll,
+    update_stock_roll,
+    delete_stock_roll,
+    process_optimization_result,
+    cancel_run,
     upload_report_to_storage,
     update_report_url,
     list_runs,
@@ -93,6 +96,22 @@ class OptimizeRequest(BaseModel):
     costs: CostsInput
     safetyStock: Optional[float] = 0
     configurationId: Optional[str] = None
+    saveToDb: Optional[bool] = True  # False ise sadece hesaplama, DB'ye kaydetmez
+    description: Optional[str] = None  # Kısa açıklama; sonuçlar tablosunda ID yerine gösterilir
+    stock_roll_ids: Optional[List[str]] = Field(None, alias="stockRollIds")
+
+
+class OrderCreateUpdate(BaseModel):
+    """Sipariş oluşturma/güncelleme isteği."""
+    id: Optional[str] = None
+    order_id: Optional[str] = None
+    m2: float
+    panel_width: float
+    panel_length: Optional[float] = 1.0
+    il: Optional[str] = None
+    bitis_tarihi: Optional[str] = None
+    aciklama: Optional[str] = None
+    status: Optional[str] = "Pending"
 
 
 class ConfigurationSaveRequest(BaseModel):
@@ -108,22 +127,9 @@ class ConfigurationSaveRequest(BaseModel):
     costs: CostsInput
 
 
-class OrderSetRequest(BaseModel):
-    """
-    Sipariş seti oluşturma/güncelleme isteği.
-    """
-    id: Optional[str] = None
-    name: str
-    orders: List[OrderInput]
-
-
-class StockSetRequest(BaseModel):
-    """
-    Stok/rulo seti oluşturma/güncelleme isteği.
-    """
-    id: Optional[str] = None
-    name: str
-    rolls: List[float]
+class StockRollCreate(BaseModel):
+    """Rulo ekleme isteği."""
+    tonnage: float
 
 
 class SummaryResponse(BaseModel):
@@ -266,11 +272,7 @@ async def optimize(request: OptimizeRequest):
             )
             raise HTTPException(status_code=400, detail=detail_msg)
         
-        # Excel rapor dosyasını oluştur
         file_id = uuid.uuid4().hex[:16]
-        excel_path = create_excel_report(results, file_id)
-
-        # Supabase'e kaydet (kesim sonuçları ve rapor)
         input_data = {
             "material": request.material.model_dump(),
             "safetyStock": request.safetyStock,
@@ -279,17 +281,31 @@ async def optimize(request: OptimizeRequest):
             "rollSettings": request.rollSettings.model_dump(),
             "costs": request.costs.model_dump(),
         }
-        save_optimization_result(
-            file_id=file_id,
-            input_data=input_data,
-            summary=results["summary"],
-            cutting_plan=results["cuttingPlan"],
-            roll_status=results["rollStatus"],
-            configuration_id=request.configurationId,
-        )
-        report_url = upload_report_to_storage(excel_path, file_id)
-        if report_url:
-            update_report_url(file_id, report_url)
+        if getattr(request, "stock_roll_ids", None) and len(request.stock_roll_ids) > 0:
+            input_data["stockRollIds"] = request.stock_roll_ids
+        run_description = (request.description or "").strip()[:500] if getattr(request, "description", None) else None
+
+        # saveToDb True ise Supabase'e kaydet ve Excel oluştur
+        save_to_db = getattr(request, "saveToDb", True)
+        if save_to_db is None:
+            save_to_db = True
+        if save_to_db:
+            excel_path = create_excel_report(results, file_id)
+            save_optimization_result(
+                file_id=file_id,
+                input_data=input_data,
+                summary=results["summary"],
+                cutting_plan=results["cuttingPlan"],
+                roll_status=results["rollStatus"],
+                configuration_id=request.configurationId,
+                description=run_description,
+            )
+            report_url = upload_report_to_storage(excel_path, file_id)
+            if report_url:
+                update_report_url(file_id, report_url)
+        else:
+            report_url = None
+            # saveToDb False: Excel oluşturma atlanır (önizleme modu)
 
         # Response oluştur
         response = OptimizeResponse(
@@ -415,79 +431,123 @@ async def get_configuration_endpoint(configuration_id: str):
     return row
 
 
-@app.get("/api/order-sets")
-async def get_order_sets():
+@app.get("/api/orders")
+async def get_orders(status: Optional[str] = None):
     """
-    Kayıtlı sipariş setlerini listeler.
+    Kayıtlı siparişleri listeler. status=Pending ile filtrelenebilir.
     """
-    return {"orderSets": list_order_sets()}
+    return {"orders": list_orders(status_filter=status)}
 
 
-@app.post("/api/order-sets")
-async def upsert_order_set(request: OrderSetRequest):
+@app.post("/api/orders")
+async def upsert_order(request: OrderCreateUpdate):
     """
-    Sipariş seti kaydeder veya günceller.
+    Sipariş kaydeder veya günceller.
     """
-    if not request.name.strip():
-        raise HTTPException(status_code=400, detail="Set adı zorunludur")
-    if len(request.orders) == 0:
-        raise HTTPException(status_code=400, detail="En az bir sipariş gerekli")
-    row = save_order_set(
-        name=request.name.strip(),
-        orders=[o.model_dump() for o in request.orders],
-        set_id=request.id,
+    if request.m2 <= 0:
+        raise HTTPException(status_code=400, detail="m² 0'dan büyük olmalıdır")
+    if request.panel_width <= 0:
+        raise HTTPException(status_code=400, detail="Panel genişliği 0'dan büyük olmalıdır")
+    if (request.panel_length or 1) <= 0:
+        raise HTTPException(status_code=400, detail="Panel uzunluğu 0'dan büyük olmalıdır")
+    row = save_order(
+        order_id=request.order_id,
+        m2=request.m2,
+        panel_width=request.panel_width,
+        panel_length=request.panel_length or 1.0,
+        il=request.il,
+        bitis_tarihi=request.bitis_tarihi,
+        aciklama=request.aciklama,
+        status=request.status or "Pending",
+        id=request.id,
     )
     if not row:
-        raise HTTPException(status_code=500, detail="Sipariş seti kaydedilemedi")
+        raise HTTPException(status_code=500, detail="Sipariş kaydedilemedi")
     return row
 
 
-@app.delete("/api/order-sets/{set_id}")
-async def remove_order_set(set_id: str):
+@app.delete("/api/orders/{order_id}")
+async def remove_order(order_id: str):
     """
-    Sipariş setini siler.
+    Siparişi siler.
     """
-    ok = delete_order_set(set_id)
+    ok = delete_order(order_id)
     if not ok:
-        raise HTTPException(status_code=500, detail="Sipariş seti silinemedi")
+        raise HTTPException(status_code=500, detail="Sipariş silinemedi")
     return {"ok": True}
 
 
-@app.get("/api/stock-sets")
-async def get_stock_sets():
+@app.get("/api/stock-rolls")
+async def get_stock_rolls():
     """
-    Kayıtlı stok/rulo setlerini listeler.
+    Kayıtlı stok rulolarını listeler.
     """
-    return {"stockSets": list_stock_sets()}
+    return {"stockRolls": list_stock_rolls()}
 
 
-@app.post("/api/stock-sets")
-async def upsert_stock_set(request: StockSetRequest):
+@app.post("/api/stock-rolls")
+async def create_stock_roll(request: StockRollCreate):
     """
-    Stok/rulo seti kaydeder veya günceller.
+    Yeni rulo ekler.
     """
-    if not request.name.strip():
-        raise HTTPException(status_code=400, detail="Set adı zorunludur")
-    if len(request.rolls) == 0:
-        raise HTTPException(status_code=400, detail="En az bir rulo gerekli")
-    clean_rolls = [float(r) for r in request.rolls if float(r) > 0]
-    if len(clean_rolls) == 0:
-        raise HTTPException(status_code=400, detail="Geçerli rulo tonajı girin")
-    row = save_stock_set(name=request.name.strip(), rolls=clean_rolls, set_id=request.id)
+    if request.tonnage <= 0:
+        raise HTTPException(status_code=400, detail="Tonaj 0'dan büyük olmalıdır")
+    row = add_stock_roll(tonnage=request.tonnage, source="manual")
     if not row:
-        raise HTTPException(status_code=500, detail="Stok seti kaydedilemedi")
+        raise HTTPException(status_code=500, detail="Rulo eklenemedi")
     return row
 
 
-@app.delete("/api/stock-sets/{set_id}")
-async def remove_stock_set(set_id: str):
+@app.patch("/api/stock-rolls/{roll_id}")
+async def patch_stock_roll(roll_id: str, request: StockRollCreate):
     """
-    Stok/rulo setini siler.
+    Rulo tonajını günceller.
     """
-    ok = delete_stock_set(set_id)
+    if request.tonnage <= 0:
+        raise HTTPException(status_code=400, detail="Tonaj 0'dan büyük olmalıdır")
+    row = update_stock_roll(roll_id, request.tonnage)
+    if not row:
+        raise HTTPException(status_code=404, detail="Rulo bulunamadı veya güncellenemedi")
+    return row
+
+
+@app.delete("/api/stock-rolls/{roll_id}")
+async def remove_stock_roll(roll_id: str):
+    """
+    Ruloyu siler.
+    """
+    ok = delete_stock_roll(roll_id)
     if not ok:
-        raise HTTPException(status_code=500, detail="Stok seti silinemedi")
+        raise HTTPException(status_code=500, detail="Rulo silinemedi")
     return {"ok": True}
+
+
+@app.post("/api/process-result/{file_id}")
+async def process_result_endpoint(file_id: str):
+    """
+    Optimizasyon sonucunu işleme alır: kalan ruloları stoka ekler, siparişleri günceller.
+    """
+    run = get_run_by_file_id(file_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Çalıştırma bulunamadı")
+    ok = process_optimization_result(file_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="İşleme alınamadı")
+    return {"ok": True, "fileId": file_id}
+
+
+@app.post("/api/runs/{file_id}/cancel")
+async def cancel_run_endpoint(file_id: str):
+    """
+    Optimizasyon çalıştırmasını iptal olarak işaretler.
+    """
+    run = get_run_by_file_id(file_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Çalıştırma bulunamadı")
+    ok = cancel_run(file_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="İptal edilemedi")
+    return {"ok": True, "fileId": file_id}
 
 
 @app.get("/api/runs")
@@ -520,6 +580,9 @@ async def get_run_detail(file_id: str):
         "inputData": run.get("input_data"),
         "createdAt": run.get("created_at"),
         "reportUrl": run.get("report_url"),
+        "runStatus": run.get("run_status", "saved"),
+        "processedAt": run.get("processed_at"),
+        "description": run.get("description"),
     }
 
 

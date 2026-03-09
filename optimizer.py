@@ -270,19 +270,19 @@ def solve_optimization(
             "ordersUsed": kullanilan_siparis
         })
     
-    # İş kuralı: 0,5 ton altı kalan stok fire sayılır
+    # İş kuralı: Kalan miktar 0,5 ton üstüyse stoğa, 0,5 ton ve altı fire sayılır
     toplam_fire = 0.0
     toplam_stok = 0.0
     for item in roll_status:
-        stok = float(item["stock"])
-        fire = float(item["fire"])
-        if stok > 0 and stok < MIN_STOCK_THRESHOLD_TON:
-            item["fire"] = round(fire + stok, 4)
+        kalan = float(item["stock"]) + float(item["fire"])
+        if kalan > MIN_STOCK_THRESHOLD_TON:
+            item["stock"] = round(kalan, 4)
+            item["fire"] = 0.0
+            toplam_stok += kalan
+        else:
             item["stock"] = 0.0
-            fire = item["fire"]
-            stok = 0.0
-        toplam_fire += fire
-        toplam_stok += stok
+            item["fire"] = round(kalan, 4)
+            toplam_fire += kalan
     
     acilan_rulo = sum([1 for i in I if pulp.value(y[i]) > 0.5])
     # Fire/stok yeniden sınıflandığı için maliyeti buna göre güncelle
