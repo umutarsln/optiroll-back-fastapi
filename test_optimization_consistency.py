@@ -17,6 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from optimizer import (
     solve_optimization,
     calculate_demand,
+    calculate_return_gap_penalty,
+    build_roll_order_sequence,
+    apply_sequence_local_improvement,
     MIN_STOCK_THRESHOLD_TON,
 )
 
@@ -218,6 +221,347 @@ class TestOptimizationConsistency(unittest.TestCase):
         opened = results["summary"]["openedRolls"]
         used_count = sum(1 for r in roll_status if float(r.get("used", 0) or 0) > 0.0001)
         self.assertEqual(opened, used_count, "openedRolls kullanılan rulo sayısına eşit olmalı")
+
+    def test_calculate_demand_surface_factor_doubles_tonnage(self):
+        """surface_factor=2 oldugunda talep tonaji, surface_factor=1'e gore iki kat olmali."""
+        orders = _make_orders([120, 80], panel_width=1.0, panel_length=2.0)
+        panel_widths = [1.0, 1.0]
+        panel_lengths = [2.0, 2.0]
+        demand_single, total_single = calculate_demand(
+            orders=orders,
+            thickness=0.75,
+            density=7.85,
+            panel_widths=panel_widths,
+            panel_lengths=panel_lengths,
+            surface_factor=1.0,
+        )
+        demand_double, total_double = calculate_demand(
+            orders=orders,
+            thickness=0.75,
+            density=7.85,
+            panel_widths=panel_widths,
+            panel_lengths=panel_lengths,
+            surface_factor=2.0,
+        )
+        self.assertAlmostEqual(total_double, total_single * 2, places=3)
+        for j in demand_single:
+            self.assertAlmostEqual(demand_double[j], demand_single[j] * 2, places=3)
+
+    def test_return_gap_penalty_excess_over_max_interleaving(self):
+        """Araya fazla siparis girdiginde ceza ve ihlal listesi uretilmeli."""
+        seq = {1: [1, 2, 3, 4, 1]}
+        penalty, violations = calculate_return_gap_penalty(seq, max_interleaving=2, penalty_per_excess=10.0)
+        self.assertGreater(penalty, 0)
+        self.assertTrue(any(v.get("excess", 0) > 0 for v in violations))
+
+    def test_return_gap_penalty_zero_cost_still_records_violations(self):
+        """Ceza birimi 0 iken parasal ceza 0, ihlal kaydi tutulabilir."""
+        seq = {1: [1, 2, 3, 4, 1]}
+        penalty, violations = calculate_return_gap_penalty(seq, max_interleaving=2, penalty_per_excess=0.0)
+        self.assertAlmostEqual(penalty, 0.0, places=4)
+        self.assertGreater(len(violations), 0)
+
+    def test_solve_includes_sequence_metadata(self):
+        """solve_optimization ciktisinda sıra cezasi alanlari bulunmali."""
+        orders = _make_orders([50, 40], panel_width=1.0)
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=[1.0, 1.0],
+            rolls=[15, 12, 10],
+            max_orders_per_roll=5,
+            max_rolls_per_order=3,
+            fire_cost=450,
+            setup_cost=120,
+            stock_cost=2.5,
+            time_limit_seconds=30,
+            max_interleaving_orders=2,
+            interleaving_penalty_cost=0.0,
+        )
+        self.assertEqual(status, "Optimal")
+        self.assertIn("sequencePenalty", results)
+        self.assertIn("sequenceViolations", results)
+        self.assertIn("rollOrderSequences", results)
+        self.assertIn("sequencePenalty", results["summary"])
+        self.assertIn("interleavingViolationCount", results["summary"])
+
+    def test_build_roll_order_sequence_from_plan(self):
+        """Kesim plani satir sirasindan rulo siparis dizisi cikarilmali."""
+        plan = [
+            {"rollId": 1, "orderId": 2, "tonnage": 1},
+            {"rollId": 1, "orderId": 1, "tonnage": 1},
+            {"rollId": 2, "orderId": 1, "tonnage": 1},
+        ]
+        seq = build_roll_order_sequence(plan)
+        self.assertEqual(seq[1], [2, 1])
+        self.assertEqual(seq[2], [1])
+
+    def test_return_gap_penalty_exactly_two_distinct_interleaved_no_penalty(self):
+        """Tam 2 farklı araya sipariş (max=2) iken parasal ceza ve ihlal olmamalı."""
+        seq = {1: [1, 2, 3, 1]}
+        penalty, violations = calculate_return_gap_penalty(
+            seq, max_interleaving=2, penalty_per_excess=10.0
+        )
+        self.assertAlmostEqual(penalty, 0.0, places=4)
+        self.assertEqual(len(violations), 0)
+
+    def test_return_gap_penalty_three_distinct_interleaved_triggers(self):
+        """3 farklı araya sipariş (max=2) iken en az bir ihlal ve pozitif ceza."""
+        seq = {1: [1, 2, 3, 4, 1]}
+        penalty, violations = calculate_return_gap_penalty(
+            seq, max_interleaving=2, penalty_per_excess=10.0
+        )
+        self.assertGreater(penalty, 0)
+        self.assertGreaterEqual(len(violations), 1)
+        self.assertEqual(penalty, 10.0)
+
+    def test_build_roll_order_sequence_duplicate_order_same_roll(self):
+        """Aynı ruloda aynı sipariş birden fazla satırda tekrarlanırsa sıra korunur (çoklu segment)."""
+        plan = [
+            {"rollId": 1, "orderId": 1, "tonnage": 0.5},
+            {"rollId": 1, "orderId": 2, "tonnage": 0.5},
+            {"rollId": 1, "orderId": 3, "tonnage": 0.5},
+            {"rollId": 1, "orderId": 4, "tonnage": 0.5},
+            {"rollId": 1, "orderId": 1, "tonnage": 0.5},
+        ]
+        seq = build_roll_order_sequence(plan)
+        self.assertEqual(seq[1], [1, 2, 3, 4, 1])
+
+    def test_apply_sequence_local_improvement_never_increases_penalty(self):
+        """Yerel sıra iyileştirmesi, rulolar üzerinde toplam sıra cezasını artırmaz."""
+        plan = [
+            {"rollId": 1, "orderId": 1, "tonnage": 1},
+            {"rollId": 1, "orderId": 2, "tonnage": 1},
+            {"rollId": 1, "orderId": 3, "tonnage": 1},
+            {"rollId": 1, "orderId": 4, "tonnage": 1},
+            {"rollId": 1, "orderId": 1, "tonnage": 1},
+            {"rollId": 2, "orderId": 5, "tonnage": 1},
+            {"rollId": 2, "orderId": 1, "tonnage": 1},
+            {"rollId": 2, "orderId": 2, "tonnage": 1},
+            {"rollId": 2, "orderId": 3, "tonnage": 1},
+            {"rollId": 2, "orderId": 4, "tonnage": 1},
+            {"rollId": 2, "orderId": 1, "tonnage": 1},
+        ]
+        max_int, unit = 2, 25.0
+        seq_before = build_roll_order_sequence(plan)
+        pen_before, _ = calculate_return_gap_penalty(seq_before, max_int, unit)
+        improved, _ = apply_sequence_local_improvement(plan, max_int, unit)
+        seq_after = build_roll_order_sequence(improved)
+        pen_after, _ = calculate_return_gap_penalty(seq_after, max_int, unit)
+        self.assertLessEqual(pen_after, pen_before)
+
+    def test_dual_roll_with_surface_factor_two_demand_and_min_two_rolls(self):
+        """surface_factor=2: talep 2x, kesim toplamı D, üst/alt yüzey tonajı modelde tam D/2, en az 2 rulo/sipariş."""
+        orders = _make_orders([80, 70], panel_width=1.0, panel_length=1.0)
+        panel_widths = [1.0, 1.0]
+        panel_lengths = [1.0, 1.0]
+        demand, _ = calculate_demand(
+            orders=orders,
+            thickness=0.75,
+            density=7.85,
+            panel_widths=panel_widths,
+            panel_lengths=panel_lengths,
+            surface_factor=2.0,
+        )
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=panel_widths,
+            panel_lengths=panel_lengths,
+            rolls=[10, 10, 10, 10, 10],
+            max_orders_per_roll=5,
+            max_rolls_per_order=5,
+            fire_cost=450,
+            setup_cost=120,
+            stock_cost=2.5,
+            time_limit_seconds=30,
+            surface_factor=2.0,
+        )
+        self.assertEqual(status, "Optimal")
+        cutting_plan = results["cuttingPlan"]
+        per_order_rolls = {}
+        for item in cutting_plan:
+            j = int(item["orderId"]) - 1
+            per_order_rolls.setdefault(j, set()).add(int(item["rollId"]))
+        ton_per_order = {}
+        for c in cutting_plan:
+            oid = int(c["orderId"])
+            ton_per_order[oid] = ton_per_order.get(oid, 0) + float(c["tonnage"])
+        for j, demand_j in demand.items():
+            self.assertAlmostEqual(
+                ton_per_order[j + 1],
+                demand_j,
+                places=2,
+                msg="Çift yüzey talebi kesim tonajı ile örtüşmeli",
+            )
+        for j, demand_j in demand.items():
+            oid = j + 1
+            half = demand_j / 2.0
+            upper_sum = 0.0
+            lower_sum = 0.0
+            for c in cutting_plan:
+                if int(c["orderId"]) != oid:
+                    continue
+                upper_sum += float(c.get("upperTonnage", 0))
+                lower_sum += float(c.get("lowerTonnage", 0))
+            self.assertAlmostEqual(
+                upper_sum,
+                half,
+                places=2,
+                msg=f"Sipariş {oid}: üst yüzey tonajı toplamı D/2 olmalı",
+            )
+            self.assertAlmostEqual(
+                lower_sum,
+                half,
+                places=2,
+                msg=f"Sipariş {oid}: alt yüzey tonajı toplamı D/2 olmalı",
+            )
+        for j in demand:
+            self.assertGreaterEqual(
+                len(per_order_rolls.get(j, set())),
+                2,
+                msg=f"Sipariş {j+1} en az 2 ruloda görünmeli",
+            )
+
+    def test_surface_factor_two_small_orders_still_feasible(self):
+        """Düşük m² siparişlerde surface_factor=2 ve min iki rulo ile çözüm bulunabilmeli."""
+        orders = _make_orders([30, 25], panel_width=1.0, panel_length=1.0)
+        panel_widths = [1.0, 1.0]
+        panel_lengths = [1.0, 1.0]
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=panel_widths,
+            panel_lengths=panel_lengths,
+            rolls=[12, 12, 12, 12],
+            max_orders_per_roll=4,
+            max_rolls_per_order=4,
+            fire_cost=450,
+            setup_cost=120,
+            stock_cost=2.5,
+            time_limit_seconds=30,
+            surface_factor=2.0,
+        )
+        self.assertEqual(status, "Optimal")
+        self.assertIsNotNone(results)
+
+    def test_roll_orders_used_respects_max_orders_per_roll(self):
+        """LP kısıtı: kullanılan her ruloda distinct sipariş sayısı max_orders_per_roll altında."""
+        orders = _make_orders([90, 85, 80, 75], panel_width=1.0)
+        rolls = [12, 12, 12, 12, 12, 12]
+        max_opr = 3
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=[1.0, 1.0, 1.0, 1.0],
+            rolls=rolls,
+            max_orders_per_roll=max_opr,
+            max_rolls_per_order=6,
+            fire_cost=450,
+            setup_cost=120,
+            stock_cost=2.5,
+            time_limit_seconds=45,
+        )
+        self.assertEqual(status, "Optimal")
+        cutting_plan = results["cuttingPlan"]
+        per_roll_orders = {}
+        for c in cutting_plan:
+            rid = int(c["rollId"])
+            oid = int(c["orderId"])
+            per_roll_orders.setdefault(rid, set()).add(oid)
+        for rid, oset in per_roll_orders.items():
+            self.assertLessEqual(
+                len(oset),
+                max_opr,
+                msg=f"Rulo {rid}: en fazla {max_opr} sipariş olmalı",
+            )
+        for item in results["rollStatus"]:
+            if float(item.get("used", 0) or 0) <= 0.0001:
+                continue
+            self.assertLessEqual(
+                int(item.get("ordersUsed", 0)),
+                max_opr,
+                msg=f"roll_status.ordersUsed rulo {item['rollId']}",
+            )
+
+    def test_summary_total_cost_matches_fire_stock_setup_sequence(self):
+        """summary.totalCost = fire*totalFire + stock*totalStock + setup*openedRolls + sequencePenalty."""
+        fire_cost, setup_cost, stock_cost = 450.0, 120.0, 2.5
+        orders = _make_orders([55, 45], panel_width=1.0)
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=[1.0, 1.0],
+            rolls=[14, 12, 10],
+            max_orders_per_roll=5,
+            max_rolls_per_order=3,
+            fire_cost=fire_cost,
+            setup_cost=setup_cost,
+            stock_cost=stock_cost,
+            time_limit_seconds=30,
+            max_interleaving_orders=2,
+            interleaving_penalty_cost=50.0,
+        )
+        self.assertEqual(status, "Optimal")
+        s = results["summary"]
+        expected = (
+            float(s["totalFire"]) * fire_cost
+            + float(s["totalStock"]) * stock_cost
+            + int(s["openedRolls"]) * setup_cost
+            + float(s["sequencePenalty"])
+        )
+        self.assertAlmostEqual(float(s["totalCost"]), expected, places=1)
+
+    def test_standard_lp_cutting_plan_no_repeat_order_per_roll_zero_interleaving(self):
+        """Tek (rulo,sipariş) satırı modelinde aynı ruloda sipariş tekrarı yok; sıra ihlali beklenmez."""
+        orders = _make_orders([70, 65, 60], panel_width=1.0)
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=[1.0, 1.0, 1.0],
+            rolls=[15, 14, 13, 12],
+            max_orders_per_roll=5,
+            max_rolls_per_order=4,
+            fire_cost=450,
+            setup_cost=120,
+            stock_cost=2.5,
+            time_limit_seconds=45,
+            max_interleaving_orders=2,
+            interleaving_penalty_cost=100.0,
+        )
+        self.assertEqual(status, "Optimal")
+        self.assertAlmostEqual(float(results["sequencePenalty"]), 0.0, places=4)
+        self.assertEqual(len(results["sequenceViolations"]), 0)
+        self.assertEqual(int(results["summary"]["interleavingViolationCount"]), 0)
+        by_roll = {}
+        for c in results["cuttingPlan"]:
+            rid = int(c["rollId"])
+            oid = int(c["orderId"])
+            by_roll.setdefault(rid, []).append(oid)
+        for rid, oids in by_roll.items():
+            self.assertEqual(len(oids), len(set(oids)), f"Rulo {rid} tekrarsız sipariş")
+
+    def test_synthetic_multisegment_same_roll_interleaving_penalty_formula(self):
+        """Çoklu segment: 1→2→3→4→1 dizisinde max=2 için 1 birim fazlalık cezası (birim fiyat 7)."""
+        plan = [
+            {"rollId": 1, "orderId": 1, "tonnage": 0.1},
+            {"rollId": 1, "orderId": 2, "tonnage": 0.1},
+            {"rollId": 1, "orderId": 3, "tonnage": 0.1},
+            {"rollId": 1, "orderId": 4, "tonnage": 0.1},
+            {"rollId": 1, "orderId": 1, "tonnage": 0.1},
+        ]
+        seq = build_roll_order_sequence(plan)
+        penalty, violations = calculate_return_gap_penalty(
+            seq, max_interleaving=2, penalty_per_excess=7.0
+        )
+        self.assertAlmostEqual(penalty, 7.0, places=4)
+        self.assertTrue(any(v["orderId"] == 1 and v["excess"] == 1 for v in violations))
 
 
 if __name__ == "__main__":

@@ -6,11 +6,104 @@ import os
 import logging
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
 # Lazy load - Supabase yoksa hata vermez
 _client = None
+
+
+class SupabaseTransportError(Exception):
+    """
+    Supabase'e TCP/DNS/zaman aşımı ile ulaşılamadığında fırlatılır.
+    HTTP 503 ile ayrıştırılır; kayıt yok (404) ile karıştırılmamalıdır.
+    """
+
+
+class SupabaseWriteError(Exception):
+    """
+    Supabase insert/update/delete başarısız olduğunda fırlatılır (sipariş, stok rulosu vb.).
+    HTTP yanıtı için status_code: 503 ağ/yapılandırma, 404 kayıt yok, 502 diğer.
+    """
+
+    def __init__(self, message: str, status_code: int = 502) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+# Geriye dönük importlar için
+OrderSaveError = SupabaseWriteError
+
+
+def _msg_supabase_required_for_writes() -> str:
+    """
+    Yazma işlemleri için ortamda Supabase yokken gösterilecek kullanıcı mesajı.
+    """
+    return (
+        "Veritabanı (Supabase) gerekli. backend/.env içinde SUPABASE_URL "
+        "(örn. https://xxxx.supabase.co) ve SUPABASE_SERVICE_KEY (secret) tanımlayın; "
+        "URL erişilebilir ve DNS çözülebilir olmalıdır."
+    )
+
+
+def _is_network_related_error(exc: Exception) -> bool:
+    """
+    DNS/TCP/zaman aşımı gibi ulaşılamazlık hatalarını tespit eder (503 için).
+    """
+    try:
+        import httpx
+        if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError)):
+            return True
+    except ImportError:
+        pass
+    low = str(exc).lower()
+    return any(
+        s in low
+        for s in (
+            "nodename nor servname",
+            "name or service not known",
+            "failed to resolve",
+            "connection refused",
+            "network is unreachable",
+        )
+    )
+
+
+def _supabase_url_has_valid_host(url: str) -> bool:
+    """
+    SUPABASE_URL içinde http(s) şeması ve çözümlenebilir bir host adı olup olmadığını kabaca doğrular.
+    Boş host (ör. 'https://') gibi değerlerde False döner.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").strip()
+    return bool(host)
+
+
+def _log_supabase_transport_error(operation: str, exc: Exception) -> None:
+    """
+    DNS / TCP / zaman aşımı kaynaklı Supabase hatalarında kısa uyarı; beklenmeyen hatalarda traceback.
+    """
+    try:
+        import httpx
+    except ImportError:
+        httpx = None
+    if httpx is not None and isinstance(exc, (httpx.ConnectError, httpx.TimeoutException)):
+        logger.warning(
+            "Supabase %s: sunucuya bağlanılamadı (%s). SUPABASE_URL (ör. https://xxxx.supabase.co) ve ağı kontrol edin.",
+            operation,
+            exc,
+        )
+        return
+    logger.exception("Supabase %s hatası: %s", operation, exc)
 
 
 def get_supabase_client():
@@ -29,6 +122,13 @@ def get_supabase_client():
 
     if not url or not key:
         logger.info("Supabase bağlantısı atlandı: SUPABASE_URL veya SUPABASE_KEY tanımlı değil")
+        return None
+
+    if not _supabase_url_has_valid_host(url):
+        logger.info(
+            "Supabase bağlantısı atlandı: SUPABASE_URL geçersiz veya host eksik (örn. 'https://xxxx.supabase.co'). "
+            ".env içindeki değeri kontrol edin."
+        )
         return None
 
     # Backend için sadece secret key kullanılmalı; publishable key "Invalid API key" verir
@@ -446,7 +546,7 @@ def list_runs(limit: int = 50, offset: int = 0) -> List[Dict]:
         )
         return resp.data or []
     except Exception as e:
-        logger.exception("Supabase list_runs hatası: %s", str(e))
+        _log_supabase_transport_error("list_runs", e)
         return []
 
 
@@ -459,11 +559,17 @@ def get_run_by_file_id(file_id: str) -> Optional[Dict]:
         return None
 
     try:
+        import httpx
+    except ImportError:
+        httpx = None
+    try:
         resp = client.table("optimization_runs").select("*").eq("file_id", file_id).execute()
         if resp.data and len(resp.data) > 0:
             return resp.data[0]
     except Exception as e:
-        logger.exception("Supabase sorgu hatası: %s", str(e))
+        _log_supabase_transport_error("get_run_by_file_id", e)
+        if httpx is not None and isinstance(e, (httpx.ConnectError, httpx.TimeoutException)):
+            raise SupabaseTransportError(str(e)) from e
     return None
 
 
@@ -487,7 +593,7 @@ def list_orders(status_filter: Optional[str] = None) -> List[Dict]:
         resp = query.execute()
         return resp.data or []
     except Exception as e:
-        logger.exception("Siparişler listelenemedi: %s", str(e))
+        _log_supabase_transport_error("list_orders", e)
         return []
 
 
@@ -502,7 +608,7 @@ def save_order(
     aciklama: Optional[str] = None,
     status: str = "Pending",
     id: Optional[str] = None,
-) -> Optional[Dict]:
+) -> Dict:
     """
     Sipariş kaydeder veya günceller.
 
@@ -518,11 +624,14 @@ def save_order(
         id: Güncellenecek sipariş UUID (opsiyonel)
 
     Returns:
-        Kaydedilen sipariş satırı veya None
+        Kaydedilen sipariş satırı
+
+    Raises:
+        SupabaseWriteError: Supabase yok, ağ hatası veya kayıt başarısız
     """
     client = get_supabase_client()
     if not client:
-        return None
+        raise SupabaseWriteError(_msg_supabase_required_for_writes(), status_code=503)
     try:
         row = {
             "order_id": order_id,
@@ -539,15 +648,29 @@ def save_order(
             resp = client.table("orders").update(row).eq("id", id).execute()
             if resp.data and len(resp.data) > 0:
                 return resp.data[0]
-            return None
+            raise SupabaseWriteError(
+                "Sipariş güncellenemedi: kayıt bulunamadı veya yetki/RLS engeli olabilir (id doğru mu?).",
+                status_code=404,
+            )
         row.pop("updated_at", None)
         resp = client.table("orders").insert(row).execute()
         if resp.data and len(resp.data) > 0:
             return resp.data[0]
-        return None
+        raise SupabaseWriteError(
+            "Kayıt oluşturulamadı (boş yanıt). Supabase orders tablosu ve RLS politikalarını kontrol edin.",
+            status_code=502,
+        )
+    except SupabaseWriteError:
+        raise
     except Exception as e:
         logger.exception("Sipariş kaydedilemedi: %s", str(e))
-        return None
+        code = 503 if _is_network_related_error(e) else 502
+        hint = (
+            " Veritabanı sunucusuna ulaşılamıyor; SUPABASE_URL ve ağı kontrol edin."
+            if code == 503
+            else ""
+        )
+        raise SupabaseWriteError(f"Sipariş kaydedilemedi: {e!s}.{hint}", status_code=code) from e
 
 
 def delete_order(order_id: str) -> bool:
@@ -590,11 +713,11 @@ def list_stock_rolls() -> List[Dict]:
         )
         return resp.data or []
     except Exception as e:
-        logger.exception("Stok ruloları listelenemedi: %s", str(e))
+        _log_supabase_transport_error("list_stock_rolls", e)
         return []
 
 
-def add_stock_roll(tonnage: float, source: str = "manual", run_id: Optional[str] = None) -> Optional[Dict]:
+def add_stock_roll(tonnage: float, source: str = "manual", run_id: Optional[str] = None) -> Dict:
     """
     Yeni rulo ekler.
 
@@ -604,11 +727,14 @@ def add_stock_roll(tonnage: float, source: str = "manual", run_id: Optional[str]
         run_id: Optimizasyondan geldiyse run UUID (opsiyonel)
 
     Returns:
-        Eklenen rulo satırı veya None
+        Eklenen rulo satırı
+
+    Raises:
+        SupabaseWriteError: Supabase yok, ağ veya API hatası
     """
     client = get_supabase_client()
     if not client:
-        return None
+        raise SupabaseWriteError(_msg_supabase_required_for_writes(), status_code=503)
     try:
         row = {
             "tonnage": float(tonnage),
@@ -618,13 +744,20 @@ def add_stock_roll(tonnage: float, source: str = "manual", run_id: Optional[str]
         resp = client.table("stock_rolls").insert(row).execute()
         if resp.data and len(resp.data) > 0:
             return resp.data[0]
-        return None
+        raise SupabaseWriteError(
+            "Rulo eklenemedi (boş yanıt). stock_rolls tablosu ve RLS politikalarını kontrol edin.",
+            status_code=502,
+        )
+    except SupabaseWriteError:
+        raise
     except Exception as e:
         logger.exception("Rulo eklenemedi: %s", str(e))
-        return None
+        code = 503 if _is_network_related_error(e) else 502
+        hint = " Veritabanına ulaşılamıyor; SUPABASE_URL ve DNS/ağı kontrol edin." if code == 503 else ""
+        raise SupabaseWriteError(f"Rulo eklenemedi: {e!s}.{hint}", status_code=code) from e
 
 
-def update_stock_roll(roll_id: str, tonnage: float) -> Optional[Dict]:
+def update_stock_roll(roll_id: str, tonnage: float) -> Dict:
     """
     Rulo tonajını günceller.
 
@@ -633,11 +766,14 @@ def update_stock_roll(roll_id: str, tonnage: float) -> Optional[Dict]:
         tonnage: Yeni tonaj (ton)
 
     Returns:
-        Güncellenen rulo satırı veya None
+        Güncellenen rulo satırı
+
+    Raises:
+        SupabaseWriteError: Kayıt yok, ağ veya yetki hatası
     """
     client = get_supabase_client()
     if not client:
-        return None
+        raise SupabaseWriteError(_msg_supabase_required_for_writes(), status_code=503)
     try:
         resp = (
             client.table("stock_rolls")
@@ -647,31 +783,39 @@ def update_stock_roll(roll_id: str, tonnage: float) -> Optional[Dict]:
         )
         if resp.data and len(resp.data) > 0:
             return resp.data[0]
-        return None
+        raise SupabaseWriteError(
+            "Rulo bulunamadı veya güncellenemedi (id doğru mu? RLS?).",
+            status_code=404,
+        )
+    except SupabaseWriteError:
+        raise
     except Exception as e:
         logger.exception("Rulo güncellenemedi: %s", str(e))
-        return None
+        code = 503 if _is_network_related_error(e) else 502
+        hint = " Veritabanına ulaşılamıyor; SUPABASE_URL ve ağı kontrol edin." if code == 503 else ""
+        raise SupabaseWriteError(f"Rulo güncellenemedi: {e!s}.{hint}", status_code=code) from e
 
 
-def delete_stock_roll(roll_id: str) -> bool:
+def delete_stock_roll(roll_id: str) -> None:
     """
     Ruloyu siler.
 
     Args:
         roll_id: Silinecek rulo UUID
 
-    Returns:
-        Silme başarılıysa True
+    Raises:
+        SupabaseWriteError: Supabase yok veya silme başarısız
     """
     client = get_supabase_client()
     if not client:
-        return False
+        raise SupabaseWriteError(_msg_supabase_required_for_writes(), status_code=503)
     try:
         client.table("stock_rolls").delete().eq("id", roll_id).execute()
-        return True
     except Exception as e:
         logger.exception("Rulo silinemedi: %s", str(e))
-        return False
+        code = 503 if _is_network_related_error(e) else 502
+        hint = " Veritabanına ulaşılamıyor; SUPABASE_URL ve ağı kontrol edin." if code == 503 else ""
+        raise SupabaseWriteError(f"Rulo silinemedi: {e!s}.{hint}", status_code=code) from e
 
 
 def process_optimization_result(file_id: str) -> bool:
@@ -794,9 +938,12 @@ def save_stock_set(name: str, rolls: List[float], set_id: Optional[str] = None) 
     client = get_supabase_client()
     if not client:
         return None
-    for ton in rolls:
-        if float(ton) > 0:
-            add_stock_roll(tonnage=float(ton), source="manual")
+    try:
+        for ton in rolls:
+            if float(ton) > 0:
+                add_stock_roll(tonnage=float(ton), source="manual")
+    except SupabaseWriteError:
+        return None
     return {"id": "default", "name": name, "rolls": rolls}
 
 

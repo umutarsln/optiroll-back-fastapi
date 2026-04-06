@@ -22,6 +22,8 @@ from optimizer import (
     create_excel_report,
 )
 from supabase_client import (
+    SupabaseTransportError,
+    SupabaseWriteError,
     save_optimization_result,
     save_configuration,
     get_configuration_by_id,
@@ -44,6 +46,29 @@ from supabase_client import (
 )
 
 app = FastAPI(title="Kesme Stoku Optimizasyon API")
+
+# Optimizasyon tek senaryo: sipariş m² tek yüzey, talep her zaman çift yüzey (2x) ile hesaplanır.
+SURFACE_FACTOR_OPTIMIZE = 2.0
+
+
+def _get_run_row_or_http_exception(file_id: str) -> Dict:
+    """
+    optimization_runs satırını getirir. Supabase ulaşılamazsa 503, kayıt yoksa 404 döner.
+    """
+    try:
+        run = get_run_by_file_id(file_id)
+    except SupabaseTransportError as e:
+        logger.warning("Supabase erişilemiyor (file_id=%s): %s", file_id, e)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Veritabanına (Supabase) bağlanılamadı. İnternet, VPN, firewall ve .env içindeki "
+                "SUPABASE_URL (örn. https://xxxx.supabase.co) ile DNS çözümlemesini kontrol edin."
+            ),
+        ) from e
+    if not run:
+        raise HTTPException(status_code=404, detail="Çalıştırma bulunamadı")
+    return run
 
 # CORS ayarları: lokal ve production frontend origin'lerini izinli yap
 app.add_middleware(
@@ -90,11 +115,16 @@ class CostsInput(BaseModel):
 
 
 class OptimizeRequest(BaseModel):
+    """Optimizasyon isteği; talep çarpanı sunucuda sabit çift yüzey (2x) olarak uygulanır."""
     material: MaterialInput
     orders: List[OrderInput]
     rollSettings: RollSettingsInput
     costs: CostsInput
     safetyStock: Optional[float] = 0
+    surfaceFactor: Optional[float] = None  # İstemci alanı (geri uyumluluk); optimize yolunda yok sayılır, 2 kullanılır
+    requireDualRollAllocation: Optional[bool] = None  # Geri uyumluluk; yok sayılır
+    maxInterleavingOrders: Optional[int] = 2  # Araya max kaç farklı sipariş (soft ceza eşiği)
+    interleavingPenaltyCost: Optional[float] = 0.0  # Fazla araya sipariş başına ceza (0 = ceza kapalı)
     configurationId: Optional[str] = None
     saveToDb: Optional[bool] = True  # False ise sadece hesaplama, DB'ye kaydetmez
     description: Optional[str] = None  # Kısa açıklama; sonuçlar tablosunda ID yerine gösterilir
@@ -125,6 +155,10 @@ class ConfigurationSaveRequest(BaseModel):
     orders: List[OrderInput]
     rollSettings: RollSettingsInput
     costs: CostsInput
+    surfaceFactor: Optional[float] = 1.0
+    requireDualRollAllocation: Optional[bool] = False
+    maxInterleavingOrders: Optional[int] = 2
+    interleavingPenaltyCost: Optional[float] = 0.0
 
 
 class StockRollCreate(BaseModel):
@@ -137,6 +171,18 @@ class SummaryResponse(BaseModel):
     totalFire: float
     totalStock: float
     openedRolls: int
+    sequencePenalty: float = 0.0
+    interleavingViolationCount: int = 0
+
+
+class SequenceViolationItem(BaseModel):
+    """Siparişe geç dönüş (araya fazla sipariş) ihlali kaydı."""
+
+    rollId: int
+    orderId: int
+    distinctInterleavedOrders: int
+    maxAllowed: int
+    excess: int
 
 
 class CuttingPlanItem(BaseModel):
@@ -166,6 +212,9 @@ class OptimizeResponse(BaseModel):
     cuttingPlan: List[CuttingPlanItem]
     rollStatus: List[RollStatusItem]
     fileId: str
+    sequencePenalty: float = 0.0
+    sequenceViolations: List[SequenceViolationItem] = Field(default_factory=list)
+    rollOrderSequences: Dict[str, List[int]] = Field(default_factory=dict)
 
 
 @app.get("/")
@@ -216,6 +265,15 @@ async def optimize(request: OptimizeRequest):
         if request.rollSettings.maxOrdersPerRoll < 1:
             logger.warning("[400] Maksimum sipariş/rulo en az 1 (maxOrdersPerRoll=%s)", request.rollSettings.maxOrdersPerRoll)
             raise HTTPException(status_code=400, detail="Maksimum sipariş/rulo en az 1 olmalıdır")
+        if request.rollSettings.maxRollsPerOrder < 2:
+            logger.warning(
+                "[400] Çift yüzey senaryosunda max rulo/sipariş en az 2 olmalı (maxRollsPerOrder=%s)",
+                request.rollSettings.maxRollsPerOrder,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="Çift yüzey senaryosunda maksimum rulo/sipariş en az 2 olmalıdır",
+            )
         
         # Panel genişlik ve uzunluklarını kontrol et
         panel_widths = [order.panelWidth for order in request.orders]
@@ -237,6 +295,7 @@ async def optimize(request: OptimizeRequest):
             request.material.density,
             panel_widths=panel_widths,
             panel_lengths=panel_lengths,
+            surface_factor=SURFACE_FACTOR_OPTIMIZE,
         )
         
         # Rulo tonajı kontrolü (küçük yuvarlama farklarına tolerans)
@@ -244,7 +303,7 @@ async def optimize(request: OptimizeRequest):
             detail = f"Toplam rulo tonajı ({total_roll_tonnage:.2f}) ihtiyaçtan ({total_tonnage_needed:.2f}) az olamaz"
             logger.warning("[400] %s", detail)
             raise HTTPException(status_code=400, detail=detail)
-        
+
         # Optimizasyonu çöz (2 dk timeout); panel uzunluğu ile kesim: uzunluk ve katları
         status, results = solve_optimization(
             thickness=request.material.thickness,
@@ -259,12 +318,23 @@ async def optimize(request: OptimizeRequest):
             setup_cost=request.costs.setupCost,
             stock_cost=request.costs.stockCost,
             time_limit_seconds=120,
+            surface_factor=SURFACE_FACTOR_OPTIMIZE,
+            require_dual_roll_allocation=False,
+            max_interleaving_orders=int(
+                request.maxInterleavingOrders
+                if request.maxInterleavingOrders is not None
+                else 2
+            ),
+            interleaving_penalty_cost=float(request.interleavingPenaltyCost or 0.0),
         )
         
         if status != 'Optimal' or results is None:
             detail_msg = f"Optimizasyon çözülemedi. Durum: {status}"
             if status == 'Infeasible':
-                detail_msg += ". Parametreleri kontrol edin: tonaj yeterli mi, max sipariş/rulo ve max rulo/sipariş kısıtları uyumlu mu?"
+                detail_msg += (
+                    " Olası nedenler: çift yüzeyde her sipariş için üst ve alt yüzey tonajı ayrı ayrı tam D/2 olmalı; "
+                    "en az iki rulo; yeterli toplam kapasite; max sipariş/rulo veya max rulo/sipariş; min. lot / kurulum."
+                )
             logger.warning(
                 "[400] Optimizasyon hatası: status=%s | tonaj=%s, rulo_sayisi=%s, ihtiyaç=%s, maxOrdersPerRoll=%s, maxRollsPerOrder=%s",
                 status, total_roll_tonnage, len(rolls), total_tonnage_needed,
@@ -276,6 +346,13 @@ async def optimize(request: OptimizeRequest):
         input_data = {
             "material": request.material.model_dump(),
             "safetyStock": request.safetyStock,
+            "surfaceFactor": SURFACE_FACTOR_OPTIMIZE,
+            "maxInterleavingOrders": int(
+                request.maxInterleavingOrders
+                if request.maxInterleavingOrders is not None
+                else 2
+            ),
+            "interleavingPenaltyCost": float(request.interleavingPenaltyCost or 0.0),
             "configurationId": request.configurationId,
             "orders": [o.model_dump() for o in request.orders],
             "rollSettings": request.rollSettings.model_dump(),
@@ -314,7 +391,12 @@ async def optimize(request: OptimizeRequest):
             summary=SummaryResponse(**results['summary']),
             cuttingPlan=[CuttingPlanItem(**item) for item in results['cuttingPlan']],
             rollStatus=[RollStatusItem(**item) for item in results['rollStatus']],
-            fileId=file_id
+            fileId=file_id,
+            sequencePenalty=float(results.get('sequencePenalty', 0)),
+            sequenceViolations=[
+                SequenceViolationItem(**v) for v in results.get('sequenceViolations', [])
+            ],
+            rollOrderSequences=dict(results.get('rollOrderSequences') or {}),
         )
         
         return response
@@ -345,8 +427,11 @@ async def save_configuration_endpoint(request: ConfigurationSaveRequest):
             raise HTTPException(status_code=400, detail="En az bir sipariş gerekli")
         if request.rollSettings.maxOrdersPerRoll < 1:
             raise HTTPException(status_code=400, detail="Maksimum sipariş/rulo en az 1 olmalıdır")
-        if request.rollSettings.maxRollsPerOrder < 1:
-            raise HTTPException(status_code=400, detail="Maksimum rulo/sipariş en az 1 olmalıdır")
+        if request.rollSettings.maxRollsPerOrder < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Çift yüzey senaryosunda maksimum rulo/sipariş en az 2 olmalıdır",
+            )
 
         row = save_configuration(
             config_id=request.configurationId,
@@ -378,9 +463,7 @@ async def save_run_configuration_endpoint(file_id: str):
     Sonuç çalıştırmasının input_data alanından konfigürasyon kaydı üretir/günceller.
     """
     try:
-        run = get_run_by_file_id(file_id)
-        if not run:
-            raise HTTPException(status_code=404, detail="Çalıştırma bulunamadı veya Supabase kaydı yok")
+        run = _get_run_row_or_http_exception(file_id)
 
         input_data = run.get("input_data") or {}
         material = input_data.get("material") or {}
@@ -450,20 +533,20 @@ async def upsert_order(request: OrderCreateUpdate):
         raise HTTPException(status_code=400, detail="Panel genişliği 0'dan büyük olmalıdır")
     if (request.panel_length or 1) <= 0:
         raise HTTPException(status_code=400, detail="Panel uzunluğu 0'dan büyük olmalıdır")
-    row = save_order(
-        order_id=request.order_id,
-        m2=request.m2,
-        panel_width=request.panel_width,
-        panel_length=request.panel_length or 1.0,
-        il=request.il,
-        bitis_tarihi=request.bitis_tarihi,
-        aciklama=request.aciklama,
-        status=request.status or "Pending",
-        id=request.id,
-    )
-    if not row:
-        raise HTTPException(status_code=500, detail="Sipariş kaydedilemedi")
-    return row
+    try:
+        return save_order(
+            order_id=request.order_id,
+            m2=request.m2,
+            panel_width=request.panel_width,
+            panel_length=request.panel_length or 1.0,
+            il=request.il,
+            bitis_tarihi=request.bitis_tarihi,
+            aciklama=request.aciklama,
+            status=request.status or "Pending",
+            id=request.id,
+        )
+    except SupabaseWriteError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
 
 
 @app.delete("/api/orders/{order_id}")
@@ -492,10 +575,10 @@ async def create_stock_roll(request: StockRollCreate):
     """
     if request.tonnage <= 0:
         raise HTTPException(status_code=400, detail="Tonaj 0'dan büyük olmalıdır")
-    row = add_stock_roll(tonnage=request.tonnage, source="manual")
-    if not row:
-        raise HTTPException(status_code=500, detail="Rulo eklenemedi")
-    return row
+    try:
+        return add_stock_roll(tonnage=request.tonnage, source="manual")
+    except SupabaseWriteError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
 
 
 @app.patch("/api/stock-rolls/{roll_id}")
@@ -505,10 +588,10 @@ async def patch_stock_roll(roll_id: str, request: StockRollCreate):
     """
     if request.tonnage <= 0:
         raise HTTPException(status_code=400, detail="Tonaj 0'dan büyük olmalıdır")
-    row = update_stock_roll(roll_id, request.tonnage)
-    if not row:
-        raise HTTPException(status_code=404, detail="Rulo bulunamadı veya güncellenemedi")
-    return row
+    try:
+        return update_stock_roll(roll_id, request.tonnage)
+    except SupabaseWriteError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
 
 
 @app.delete("/api/stock-rolls/{roll_id}")
@@ -516,9 +599,10 @@ async def remove_stock_roll(roll_id: str):
     """
     Ruloyu siler.
     """
-    ok = delete_stock_roll(roll_id)
-    if not ok:
-        raise HTTPException(status_code=500, detail="Rulo silinemedi")
+    try:
+        delete_stock_roll(roll_id)
+    except SupabaseWriteError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
     return {"ok": True}
 
 
@@ -527,9 +611,7 @@ async def process_result_endpoint(file_id: str):
     """
     Optimizasyon sonucunu işleme alır: kalan ruloları stoka ekler, siparişleri günceller.
     """
-    run = get_run_by_file_id(file_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Çalıştırma bulunamadı")
+    _get_run_row_or_http_exception(file_id)
     ok = process_optimization_result(file_id)
     if not ok:
         raise HTTPException(status_code=500, detail="İşleme alınamadı")
@@ -541,9 +623,7 @@ async def cancel_run_endpoint(file_id: str):
     """
     Optimizasyon çalıştırmasını iptal olarak işaretler.
     """
-    run = get_run_by_file_id(file_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Çalıştırma bulunamadı")
+    _get_run_row_or_http_exception(file_id)
     ok = cancel_run(file_id)
     if not ok:
         raise HTTPException(status_code=500, detail="İptal edilemedi")
@@ -565,9 +645,7 @@ async def get_run_detail(file_id: str):
     Belirli bir optimizasyon çalıştırmasının detayını yalnızca Supabase'den döner.
     Frontend OptimizeResponse formatındadır.
     """
-    run = get_run_by_file_id(file_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Çalıştırma bulunamadı")
+    run = _get_run_row_or_http_exception(file_id)
     summary = run.get("summary") or {}
     return {
         "fileId": run.get("file_id", file_id),
@@ -594,9 +672,7 @@ async def delete_run(file_id: str):
     Args:
         file_id: Çalıştırma ID değeri
     """
-    run = get_run_by_file_id(file_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Çalıştırma bulunamadı")
+    _get_run_row_or_http_exception(file_id)
 
     storage_deleted = delete_report_from_storage(file_id)
     db_deleted = delete_run_by_file_id(file_id)
@@ -685,6 +761,13 @@ async def validate_input(request: OptimizeRequest):
     
     if request.rollSettings.maxOrdersPerRoll < 1:
         errors.append("Maksimum sipariş/rulo en az 1 olmalıdır")
+    if request.rollSettings.maxRollsPerOrder < 2:
+        errors.append("Çift yüzey senaryosunda maksimum rulo/sipariş en az 2 olmalıdır")
+
+    if request.maxInterleavingOrders is not None and request.maxInterleavingOrders < 0:
+        errors.append("Araya max sipariş sayısı 0 veya pozitif olmalıdır")
+    if request.interleavingPenaltyCost is not None and request.interleavingPenaltyCost < 0:
+        errors.append("Sıra ceza birimi negatif olamaz")
     
     if request.rollSettings.maxOrdersPerRoll > len(request.orders):
         errors.append(
@@ -701,6 +784,7 @@ async def validate_input(request: OptimizeRequest):
         request.material.density,
         panel_widths=[o.panelWidth for o in request.orders],
         panel_lengths=panel_lengths,
+        surface_factor=SURFACE_FACTOR_OPTIMIZE,
     )
     
     if total_roll < total_tonnage_needed:

@@ -11,8 +11,12 @@ from openpyxl.styles import Font, Alignment, PatternFill
 from datetime import datetime
 import os
 import random
+from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
+import logging
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 class OptimizationInput(BaseModel):
@@ -70,6 +74,7 @@ def calculate_demand(
     density: float,
     panel_widths: Optional[List[float]] = None,
     panel_lengths: Optional[List[float]] = None,
+    surface_factor: float = 1.0,
 ) -> Tuple[Dict, float]:
     """
     Siparişleri ton'a çevir. Tam sayı panel kısıtı için m²'yi panele yuvarlar.
@@ -81,6 +86,7 @@ def calculate_demand(
         density: Yoğunluk (g/cm³)
         panel_widths: Panel genişlikleri (yoksa order içinden alınır)
         panel_lengths: Panel kesim uzunlukları (yoksa 1.0 veya order içinden)
+        surface_factor: Talebi yüzey sayısına göre çarpan (1: tek yüzey, 2: çift yüzey)
     
     Returns:
         (Demand dictionary, Toplam tonaj)
@@ -94,11 +100,133 @@ def calculate_demand(
         # Tam sayı panel: m² / (genişlik * uzunluk) → 3*33+1 fire örneği gibi
         panel_count = round(order['m2'] / (pw * pl)) if (pw * pl) > 0 else 0
         panel_count = max(1, panel_count)
-        m2_eff = panel_count * pw * pl
+        m2_eff = panel_count * pw * pl * max(1.0, float(surface_factor))
         demand[j] = round(m2_eff * (thickness / 1000) * density, 4)
     
     total_tonnage = sum(demand.values())
     return demand, total_tonnage
+
+
+def build_roll_order_sequence(cutting_plan: List[Dict]) -> Dict[int, List[int]]:
+    """
+    Kesim planı satırlarından rulo başına sipariş kimlik sırasını üretir.
+    Satırların listedeki sırası, o rulodaki işlem sırası kabul edilir.
+
+    Args:
+        cutting_plan: rollId ve orderId içeren kesim planı öğeleri
+
+    Returns:
+        rollId -> o ruloda geçen sipariş numaraları (1 tabanlı) sırası
+    """
+    by_roll: Dict[int, List[int]] = {}
+    for row in cutting_plan:
+        rid = int(row["rollId"])
+        oid = int(row["orderId"])
+        by_roll.setdefault(rid, []).append(oid)
+    return by_roll
+
+
+def calculate_return_gap_penalty(
+    roll_sequences: Dict[int, List[int]],
+    max_interleaving: int,
+    penalty_per_excess: float,
+) -> Tuple[float, List[Dict]]:
+    """
+    Aynı siparişe art arda dönüşlerde araya giren farklı sipariş sayısını ölçer.
+    İki ziyaret arasında (önceki ve sonraki aynı sipariş indeksleri arası)
+    farklı sipariş kimlikleri max_interleaving'den fazlaysa soft ceza uygular.
+
+    Args:
+        roll_sequences: Rulo başına sipariş sırası (orderId listesi)
+        max_interleaving: İzin verilen en fazla araya giren farklı sipariş sayısı
+        penalty_per_excess: Her fazla farklı sipariş için ceza birimi
+
+    Returns:
+        (toplam_ceza, ihlal kayıtları listesi)
+    """
+    violations: List[Dict] = []
+    total_penalty = 0.0
+    if max_interleaving < 0:
+        max_interleaving = 0
+
+    for roll_id, seq in roll_sequences.items():
+        if len(seq) < 2:
+            continue
+
+        positions: Dict[int, List[int]] = defaultdict(list)
+        for idx, oid in enumerate(seq):
+            positions[oid].append(idx)
+
+        for oid, idx_list in positions.items():
+            for t in range(len(idx_list) - 1):
+                p, q = idx_list[t], idx_list[t + 1]
+                between = seq[p + 1 : q]
+                distinct_others = len({x for x in between if x != oid})
+                if distinct_others > max_interleaving:
+                    excess = distinct_others - max_interleaving
+                    if penalty_per_excess > 0:
+                        total_penalty += excess * penalty_per_excess
+                    violations.append({
+                        "rollId": roll_id,
+                        "orderId": oid,
+                        "distinctInterleavedOrders": distinct_others,
+                        "maxAllowed": max_interleaving,
+                        "excess": excess,
+                    })
+
+    return round(total_penalty, 4), violations
+
+
+def apply_sequence_local_improvement(
+    cutting_plan: List[Dict],
+    max_interleaving: int,
+    penalty_per_excess: float,
+) -> Tuple[List[Dict], Dict[int, List[int]]]:
+    """
+    Aynı rulodaki kesim satırlarının sırasını yeniden düzenleyerek sıra cezasını düşürmeyi dener.
+    Her rulo için orijinal, ters ve sipariş numarasına göre artan/azalan sıralar karşılaştırılır.
+
+    Args:
+        cutting_plan: Kesim planı satırları
+        max_interleaving: calculate_return_gap_penalty ile aynı parametre
+        penalty_per_excess: Birim ceza
+
+    Returns:
+        (iyileştirilmiş kesim planı, rulo sipariş sıraları)
+    """
+    if not cutting_plan or penalty_per_excess <= 0:
+        seq = build_roll_order_sequence(cutting_plan)
+        return cutting_plan, seq
+
+    rolls_order: List[int] = []
+    by_roll: Dict[int, List[Dict]] = {}
+    for row in cutting_plan:
+        rid = int(row["rollId"])
+        if rid not in by_roll:
+            rolls_order.append(rid)
+            by_roll[rid] = []
+        by_roll[rid].append(row)
+
+    def roll_only_penalty(roll_id: int, chunk: List[Dict]) -> float:
+        """Yalnızca tek rulo sırası için sıra cezasını hesaplar."""
+        seq_map = {roll_id: [int(r["orderId"]) for r in chunk]}
+        p, _ = calculate_return_gap_penalty(seq_map, max_interleaving, penalty_per_excess)
+        return p
+
+    new_rows: List[Dict] = []
+    for rid in rolls_order:
+        chunk = by_roll[rid]
+        candidates = [
+            chunk,
+            list(reversed(chunk)),
+            sorted(chunk, key=lambda r: int(r["orderId"])),
+            sorted(chunk, key=lambda r: -int(r["orderId"])),
+        ]
+        best = min(candidates, key=lambda c: roll_only_penalty(rid, c))
+        new_rows.extend(best)
+
+    seq = build_roll_order_sequence(new_rows)
+    return new_rows, seq
 
 
 def solve_optimization(
@@ -114,9 +242,18 @@ def solve_optimization(
     stock_cost: float,
     time_limit_seconds: int = 120,
     panel_lengths: Optional[List[float]] = None,
+    surface_factor: float = 1.0,
+    require_dual_roll_allocation: bool = False,
+    max_interleaving_orders: int = 2,
+    interleaving_penalty_cost: float = 0.0,
 ) -> Tuple[str, Optional[Dict]]:
     """
     Optimizasyon modelini çöz. Panel uzunluğu ile kesim: uzunluk ve katları (örn. 3m → 3*33+1 fire).
+    surface_factor>=2 (çift yüzey): talep 2× ile hesaplanır; sipariş başına en az iki fiziksel rulo (w toplamı >= 2).
+    Üst ve alt yüzey tonajı ayrı değişkenlerle modellenir: her sipariş j için sum_i x_u[i,j] = sum_i x_l[i,j] = D[j]/2
+    (iki yüzey aynı m² → eşit metal). Aynı rulo her iki yüzeye de pay verebilir (x_u ve x_l aynı (i,j) üzerinde pozitif olabilir).
+    require_dual_roll_allocation geri uyumluluk için yok sayılır.
+    Siparişe dönüş sırası için araya giren sipariş üst sınırını aşan kesim sıralarına soft ceza eklenebilir.
     
     Returns:
         (Status, Results dictionary veya None)
@@ -140,14 +277,21 @@ def solve_optimization(
         if pl <= 0:
             pl = 1.0
         panel_count = max(1, round(orders[j]['m2'] / (pw * pl))) if (pw * pl) > 0 else 1
-        talep_m2[j] = panel_count * pw * pl
+        talep_m2[j] = panel_count * pw * pl * max(1.0, float(surface_factor))
     D = {j: round(talep_m2[j] * (thickness / 1000) * density, 4) for j in J}
-    
+    dual_surface = float(surface_factor) >= 2.0 - 1e-12
+    D_half = {j: D[j] / 2.0 for j in J} if dual_surface else {}
+
     # Model oluştur
     model = pulp.LpProblem("Kesme_Stoku_Optimizasyonu", pulp.LpMinimize)
-    
-    # Değişkenler (main.py ile aynı - n değişkeni kaldırıldı, daha hızlı)
-    x = pulp.LpVariable.dicts("x", [(i, j) for i in I for j in J], lowBound=0, cat='Continuous')
+
+    # Değişkenler: çift yüzeyde üst/alt akış ayrı; tek yüzeyde tek x_ij
+    if dual_surface:
+        x_u = pulp.LpVariable.dicts("x_u", [(i, j) for i in I for j in J], lowBound=0, cat="Continuous")
+        x_l = pulp.LpVariable.dicts("x_l", [(i, j) for i in I for j in J], lowBound=0, cat="Continuous")
+    else:
+        x = pulp.LpVariable.dicts("x", [(i, j) for i in I for j in J], lowBound=0, cat="Continuous")
+
     u = pulp.LpVariable.dicts("u", I, lowBound=0, cat='Continuous')
     R = pulp.LpVariable.dicts("R", I, lowBound=0, cat='Continuous')
     F = pulp.LpVariable.dicts("F", I, lowBound=0, cat='Continuous')
@@ -160,34 +304,50 @@ def solve_optimization(
               pulp.lpSum([R[i] * stock_cost for i in I]) +
               pulp.lpSum([y[i] * setup_cost for i in I]), "Toplam_Maliyet")
     
-    # Talep kısıtı
+    # Talep kısıtı (çift yüzey: her yüzey tam D[j]/2)
     for j in J:
-        model += pulp.lpSum([x[(i, j)] for i in I]) == D[j], f"Talep_{j}"
-    
+        if dual_surface:
+            model += (
+                pulp.lpSum([x_u[(i, j)] for i in I]) == D_half[j],
+                f"Talep_Ust_Yuzey_{j}",
+            )
+            model += (
+                pulp.lpSum([x_l[(i, j)] for i in I]) == D_half[j],
+                f"Talep_Alt_Yuzey_{j}",
+            )
+        else:
+            model += pulp.lpSum([x[(i, j)] for i in I]) == D[j], f"Talep_{j}"
+
     # Kapasite kısıtı
     for i in I:
         model += u[i] <= S[i], f"Kapasite_{i}"
-    
-    # Kullanım tanımı
+
+    # Kullanım tanımı (rulo i üzerindeki toplam ton = tüm sipariş ve yüzeyler)
     for i in I:
-        model += u[i] == pulp.lpSum([x[(i, j)] for j in J]), f"Kullanim_{i}"
-    
+        if dual_surface:
+            model += (
+                u[i]
+                == pulp.lpSum([x_u[(i, j)] + x_l[(i, j)] for j in J]),
+                f"Kullanim_{i}",
+            )
+        else:
+            model += u[i] == pulp.lpSum([x[(i, j)] for j in J]), f"Kullanim_{i}"
+
     # Rulo kullanım tetikleyici
     for i in I:
         model += u[i] <= S[i] * y[i], f"Rulo_Kullanim_{i}"
-    
-    # Setup mantığı (Big-M): x_ij <= M * w_ij
-    for i in I:
-        for j in J:
-            model += x[(i, j)] <= S[i] * w[(i, j)], f"Setup_{i}_{j}"
-    
-    # Minimum lot size kısıtı: x_ij >= min_lot * w_ij
-    # Sipariş bazlı min lot - en küçük talebin yarısı veya 0.05 ton
+
+    # Setup / min lot: toplam akış x_u + x_l (veya tek yüzeyde x)
     min_demand = min(D.values()) if D else 0.5
     min_lot = max(0.01, min(0.5, min_demand / 2))
     for i in I:
         for j in J:
-            model += x[(i, j)] >= min_lot * w[(i, j)], f"Min_Lot_Size_{i}_{j}"
+            if dual_surface:
+                flow = x_u[(i, j)] + x_l[(i, j)]
+            else:
+                flow = x[(i, j)]
+            model += flow <= S[i] * w[(i, j)], f"Setup_{i}_{j}"
+            model += flow >= min_lot * w[(i, j)], f"Min_Lot_Size_{i}_{j}"
     
     # w_ij ve y_i bağlantısı: w_ij <= y_i
     for i in I:
@@ -201,7 +361,19 @@ def solve_optimization(
     # Sipariş başına maksimum rulo kısıtı
     for j in J:
         model += pulp.lpSum([w[(i, j)] for i in I]) <= max_rolls_per_order, f"Max_Rulo_Per_Siparis_{j}"
-    
+
+    # Çift yüzey: sipariş başına en az iki fiziksel rulo (liste sırası üst/alt kısıtı değildir)
+    if float(surface_factor) >= 2.0 - 1e-12 and len(I) >= 2:
+        for j in J:
+            model += (
+                pulp.lpSum([w[(i, j)] for i in I]) >= 2,
+                f"DualSurface_MinTwoRolls_{j}",
+            )
+    elif float(surface_factor) >= 2.0 - 1e-12 and len(I) < 2:
+        logger.warning(
+            "surface_factor>=2 ama tek rulo var: sipariş başına en az iki rulo kısıtı uygulanamaz (Infeasible riski)."
+        )
+
     # Denge kısıtı
     for i in I:
         model += R[i] + F[i] == S[i] - u[i], f"Denge_{i}"
@@ -236,11 +408,16 @@ def solve_optimization(
         j: (panel_widths[j] * (panel_lengths[j] if j < len(panel_lengths) else 1.0) * (thickness / 1000) * density)
         for j in J
     }
+    rho = (thickness / 1000) * density
     for i in I:
         for j in J:
-            if pulp.value(x[(i, j)]) > 0.0001:
-                miktar_ton = pulp.value(x[(i, j)])
-                miktar_m2 = miktar_ton / ((thickness / 1000) * density)
+            if dual_surface:
+                tu = float(pulp.value(x_u[(i, j)]) or 0.0)
+                tl = float(pulp.value(x_l[(i, j)]) or 0.0)
+                if tu <= 0.0001 and tl <= 0.0001:
+                    continue
+                miktar_ton = tu + tl
+                miktar_m2 = miktar_ton / rho if rho > 0 else 0.0
                 panel_count = int(round(miktar_ton / birim_tonaj[j])) if birim_tonaj[j] > 0 else 0
                 pl = panel_lengths[j] if j < len(panel_lengths) else 1.0
                 cutting_plan.append({
@@ -250,15 +427,55 @@ def solve_optimization(
                     "panelWidth": panel_widths[j],
                     "panelLength": pl,
                     "tonnage": round(miktar_ton, 4),
-                    "m2": round(miktar_m2, 2)
+                    "upperTonnage": round(tu, 4),
+                    "lowerTonnage": round(tl, 4),
+                    "m2": round(miktar_m2, 2),
                 })
-    
+            else:
+                if pulp.value(x[(i, j)]) > 0.0001:
+                    miktar_ton = pulp.value(x[(i, j)])
+                    miktar_m2 = miktar_ton / rho if rho > 0 else 0.0
+                    panel_count = int(round(miktar_ton / birim_tonaj[j])) if birim_tonaj[j] > 0 else 0
+                    pl = panel_lengths[j] if j < len(panel_lengths) else 1.0
+                    cutting_plan.append({
+                        "rollId": i + 1,
+                        "orderId": j + 1,
+                        "panelCount": panel_count,
+                        "panelWidth": panel_widths[j],
+                        "panelLength": pl,
+                        "tonnage": round(miktar_ton, 4),
+                        "m2": round(miktar_m2, 2),
+                    })
+
+    max_int = max(0, int(max_interleaving_orders))
+    pen_unit = float(interleaving_penalty_cost or 0.0)
+    if pen_unit > 0:
+        cutting_plan, roll_sequences = apply_sequence_local_improvement(
+            cutting_plan, max_int, pen_unit
+        )
+    else:
+        roll_sequences = build_roll_order_sequence(cutting_plan)
+
+    sequence_penalty, sequence_violations = calculate_return_gap_penalty(
+        roll_sequences, max_int, pen_unit
+    )
+
+    roll_order_sequences_json = {str(k): v for k, v in roll_sequences.items()}
+
     roll_status = []
     for i in I:
         kullanilan = pulp.value(u[i])
         fire = pulp.value(F[i])
         stok = pulp.value(R[i])
-        kullanilan_siparis = sum([1 for j in J if pulp.value(x[(i, j)]) > 0.0001])
+        if dual_surface:
+            kullanilan_siparis = sum(
+                1
+                for j in J
+                if float(pulp.value(x_u[(i, j)]) or 0.0) + float(pulp.value(x_l[(i, j)]) or 0.0)
+                > 0.0001
+            )
+        else:
+            kullanilan_siparis = sum([1 for j in J if pulp.value(x[(i, j)]) > 0.0001])
         
         roll_status.append({
             "rollId": i + 1,
@@ -286,29 +503,52 @@ def solve_optimization(
     
     acilan_rulo = sum([1 for i in I if pulp.value(y[i]) > 0.5])
     # Fire/stok yeniden sınıflandığı için maliyeti buna göre güncelle
-    guncel_maliyet = toplam_fire * fire_cost + toplam_stok * stock_cost + acilan_rulo * setup_cost
+    guncel_maliyet = (
+        toplam_fire * fire_cost
+        + toplam_stok * stock_cost
+        + acilan_rulo * setup_cost
+        + sequence_penalty
+    )
 
     summary = {
         "totalCost": round(guncel_maliyet, 2),
         "totalFire": round(toplam_fire, 4),
         "totalStock": round(toplam_stok, 4),
-        "openedRolls": acilan_rulo
+        "openedRolls": acilan_rulo,
+        "sequencePenalty": round(sequence_penalty, 4),
+        "interleavingViolationCount": len(sequence_violations),
     }
-    
+
+    lp_objective = round(pulp.value(model.objective), 2)
     results = {
         "status": status,
-        "objective": round(pulp.value(model.objective), 2),
+        "objective": round(lp_objective + sequence_penalty, 2),
         "summary": summary,
         "cuttingPlan": cutting_plan,
         "rollStatus": roll_status,
-        "model_vars": {
-            "x": x,
-            "u": u,
-            "R": R,
-            "F": F,
-            "y": y,
-            "w": w
-        },
+        "sequencePenalty": round(sequence_penalty, 4),
+        "sequenceViolations": sequence_violations,
+        "rollOrderSequences": roll_order_sequences_json,
+        "model_vars": (
+            {
+                "x_u": x_u,
+                "x_l": x_l,
+                "u": u,
+                "R": R,
+                "F": F,
+                "y": y,
+                "w": w,
+            }
+            if dual_surface
+            else {
+                "x": x,
+                "u": u,
+                "R": R,
+                "F": F,
+                "y": y,
+                "w": w,
+            }
+        ),
         "data": {
             "I": I,
             "J": J,
@@ -347,7 +587,6 @@ def create_excel_report(results: Dict, file_id: str) -> str:
     wb.remove(wb.active)
     
     data = results['data']
-    model_vars = results['model_vars']
     I = data['I']
     J = data['J']
     S = data['S']
@@ -360,14 +599,7 @@ def create_excel_report(results: Dict, file_id: str) -> str:
         panel_lengths = panel_lengths + [1.0] * (n_orders - len(panel_lengths))
     thickness = data['thickness']
     density = data['density']
-    
-    x = model_vars['x']
-    u = model_vars['u']
-    R = model_vars['R']
-    F = model_vars['F']
-    y = model_vars['y']
-    w = model_vars['w']
-    
+
     # SAYFA 1: KULLANICI VERİ GİRİŞİ
     ws_veri = wb.create_sheet("Kullanici_Veri_Girisi", 0)
     ws_veri['A1'] = "KULLANICI VERİ GİRİŞİ"
@@ -423,12 +655,17 @@ def create_excel_report(results: Dict, file_id: str) -> str:
     ws_ozet['A1'].font = Font(bold=True, size=14)
     ws_ozet.merge_cells('A1:B1')
     
+    sum_row = results["summary"]
+    seq_pen = float(sum_row.get("sequencePenalty", 0) or 0)
+    viol_n = int(sum_row.get("interleavingViolationCount", 0) or 0)
     ozet_data = [
         ["Metrik", "Değer"],
-        ["Toplam Maliyet", f"{results['summary']['totalCost']:.2f}"],
-        ["Toplam Fire (Ton)", f"{results['summary']['totalFire']:.4f}"],
-        ["Toplam Stok (Ton)", f"{results['summary']['totalStock']:.4f}"],
-        ["Açılan Rulo Sayısı", f"{results['summary']['openedRolls']}"],
+        ["Toplam Maliyet", f"{sum_row['totalCost']:.2f}"],
+        ["Sıra Cezası (siparişe dönüş)", f"{seq_pen:.4f}"],
+        ["Sıra İhlal Sayısı", str(viol_n)],
+        ["Toplam Fire (Ton)", f"{sum_row['totalFire']:.4f}"],
+        ["Toplam Stok (Ton)", f"{sum_row['totalStock']:.4f}"],
+        ["Açılan Rulo Sayısı", f"{sum_row['openedRolls']}"],
     ]
     
     for row_idx, row_data in enumerate(ozet_data, start=3):
