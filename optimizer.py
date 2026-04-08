@@ -249,9 +249,10 @@ def solve_optimization(
 ) -> Tuple[str, Optional[Dict]]:
     """
     Optimizasyon modelini çöz. Panel uzunluğu ile kesim: uzunluk ve katları (örn. 3m → 3*33+1 fire).
-    surface_factor>=2 (çift yüzey): talep 2× ile hesaplanır; sipariş başına en az iki fiziksel rulo (w toplamı >= 2).
+    surface_factor>=2 (çift yüzey): talep 2× ile hesaplanır; sipariş başına en az iki fiziksel rulo (w_u+w_l toplamı >= 2).
     Üst ve alt yüzey tonajı ayrı değişkenlerle modellenir: her sipariş j için sum_i x_u[i,j] = sum_i x_l[i,j] = D[j]/2
-    (iki yüzey aynı m² → eşit metal). Aynı rulo her iki yüzeye de pay verebilir (x_u ve x_l aynı (i,j) üzerinde pozitif olabilir).
+    (iki yüzey aynı m² → eşit metal). Aynı fiziksel rulo aynı sipariş için üst ve alt yüzeye aynı anda takılamaz:
+    her (i,j) için w_u[i,j]+w_l[i,j] <= 1; dolayısıyla x_u[i,j] ve x_l[i,j]’den en fazla biri pozitif olabilir.
     require_dual_roll_allocation geri uyumluluk için yok sayılır.
     Siparişe dönüş sırası için araya giren sipariş üst sınırını aşan kesim sıralarına soft ceza eklenebilir.
     
@@ -297,7 +298,12 @@ def solve_optimization(
     F = pulp.LpVariable.dicts("F", I, lowBound=0, cat='Continuous')
     b = pulp.LpVariable.dicts("b", I, cat='Binary')
     y = pulp.LpVariable.dicts("y", I, cat='Binary')
-    w = pulp.LpVariable.dicts("w", [(i, j) for i in I for j in J], cat='Binary')
+    # Çift yüzey: rulo–sipariş çifti ya üst ya alt yüzeye (ikisi birden değil); tek yüzeyde tek w_ij.
+    if dual_surface:
+        w_u = pulp.LpVariable.dicts("w_u", [(i, j) for i in I for j in J], cat='Binary')
+        w_l = pulp.LpVariable.dicts("w_l", [(i, j) for i in I for j in J], cat='Binary')
+    else:
+        w = pulp.LpVariable.dicts("w", [(i, j) for i in I for j in J], cat='Binary')
     
     # Amaç fonksiyonu
     model += (pulp.lpSum([F[i] * fire_cost for i in I]) +
@@ -337,36 +343,59 @@ def solve_optimization(
     for i in I:
         model += u[i] <= S[i] * y[i], f"Rulo_Kullanim_{i}"
 
-    # Setup / min lot: toplam akış x_u + x_l (veya tek yüzeyde x)
+    # Setup / min lot: çift yüzeyde üst ve alt ayrı w ile bağlanır; aynı (i,j)’de en fazla bir yüzey.
     min_demand = min(D.values()) if D else 0.5
     min_lot = max(0.01, min(0.5, min_demand / 2))
     for i in I:
         for j in J:
             if dual_surface:
-                flow = x_u[(i, j)] + x_l[(i, j)]
+                model += x_u[(i, j)] <= S[i] * w_u[(i, j)], f"Setup_U_{i}_{j}"
+                model += x_l[(i, j)] <= S[i] * w_l[(i, j)], f"Setup_L_{i}_{j}"
+                model += x_u[(i, j)] >= min_lot * w_u[(i, j)], f"Min_Lot_U_{i}_{j}"
+                model += x_l[(i, j)] >= min_lot * w_l[(i, j)], f"Min_Lot_L_{i}_{j}"
+                model += (
+                    w_u[(i, j)] + w_l[(i, j)] <= 1,
+                    f"Rulo_Siparis_Tek_Yuzey_{i}_{j}",
+                )
             else:
                 flow = x[(i, j)]
-            model += flow <= S[i] * w[(i, j)], f"Setup_{i}_{j}"
-            model += flow >= min_lot * w[(i, j)], f"Min_Lot_Size_{i}_{j}"
-    
-    # w_ij ve y_i bağlantısı: w_ij <= y_i
+                model += flow <= S[i] * w[(i, j)], f"Setup_{i}_{j}"
+                model += flow >= min_lot * w[(i, j)], f"Min_Lot_Size_{i}_{j}"
+
+    # w / (w_u,w_l) ve y_i bağlantısı
     for i in I:
         for j in J:
-            model += w[(i, j)] <= y[i], f"W_Y_Link_{i}_{j}"
-    
-    # Rulo başına maksimum sipariş kısıtı (y_i ile çarpım - main.py'deki gibi)
+            if dual_surface:
+                model += w_u[(i, j)] <= y[i], f"W_U_Y_Link_{i}_{j}"
+                model += w_l[(i, j)] <= y[i], f"W_L_Y_Link_{i}_{j}"
+            else:
+                model += w[(i, j)] <= y[i], f"W_Y_Link_{i}_{j}"
+
+    # Rulo başına maksimum sipariş kısıtı (çift yüzeyde aynı sipariş iki yüzeyde sayılmaz: w_u+w_l <= 1)
     for i in I:
-        model += pulp.lpSum([w[(i, j)] for j in J]) <= max_orders_per_roll * y[i], f"Max_Siparis_Per_Rulo_{i}"
-    
+        if dual_surface:
+            model += (
+                pulp.lpSum([w_u[(i, j)] + w_l[(i, j)] for j in J]) <= max_orders_per_roll * y[i],
+                f"Max_Siparis_Per_Rulo_{i}",
+            )
+        else:
+            model += pulp.lpSum([w[(i, j)] for j in J]) <= max_orders_per_roll * y[i], f"Max_Siparis_Per_Rulo_{i}"
+
     # Sipariş başına maksimum rulo kısıtı
     for j in J:
-        model += pulp.lpSum([w[(i, j)] for i in I]) <= max_rolls_per_order, f"Max_Rulo_Per_Siparis_{j}"
+        if dual_surface:
+            model += (
+                pulp.lpSum([w_u[(i, j)] + w_l[(i, j)] for i in I]) <= max_rolls_per_order,
+                f"Max_Rulo_Per_Siparis_{j}",
+            )
+        else:
+            model += pulp.lpSum([w[(i, j)] for i in I]) <= max_rolls_per_order, f"Max_Rulo_Per_Siparis_{j}"
 
-    # Çift yüzey: sipariş başına en az iki fiziksel rulo (liste sırası üst/alt kısıtı değildir)
+    # Çift yüzey: sipariş başına en az iki fiziksel rulo (üst ve alt için farklı rulo–sipariş atamaları)
     if float(surface_factor) >= 2.0 - 1e-12 and len(I) >= 2:
         for j in J:
             model += (
-                pulp.lpSum([w[(i, j)] for i in I]) >= 2,
+                pulp.lpSum([w_u[(i, j)] + w_l[(i, j)] for i in I]) >= 2,
                 f"DualSurface_MinTwoRolls_{j}",
             )
     elif float(surface_factor) >= 2.0 - 1e-12 and len(I) < 2:
@@ -537,7 +566,8 @@ def solve_optimization(
                 "R": R,
                 "F": F,
                 "y": y,
-                "w": w,
+                "w_u": w_u,
+                "w_l": w_l,
             }
             if dual_surface
             else {

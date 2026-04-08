@@ -425,6 +425,42 @@ class TestOptimizationConsistency(unittest.TestCase):
                 msg=f"Sipariş {j+1} en az 2 ruloda görünmeli",
             )
 
+    def test_dual_surface_same_physical_roll_not_upper_and_lower_same_order(self):
+        """
+        Çift yüzeyde aynı fiziksel rulo, aynı sipariş için üst ve alt yüzeye aynı anda atanamaz;
+        kesim satırında üst ve alt tonaj birlikte pozitif olmamalı.
+        """
+        orders = _make_orders([80, 70], panel_width=1.0, panel_length=1.0)
+        panel_widths = [1.0, 1.0]
+        panel_lengths = [1.0, 1.0]
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=panel_widths,
+            panel_lengths=panel_lengths,
+            rolls=[10, 10, 10, 10, 10],
+            max_orders_per_roll=5,
+            max_rolls_per_order=5,
+            fire_cost=450,
+            setup_cost=120,
+            stock_cost=2.5,
+            time_limit_seconds=30,
+            surface_factor=2.0,
+        )
+        self.assertEqual(status, "Optimal")
+        eps = 1e-3
+        for item in results["cuttingPlan"]:
+            u = float(item.get("upperTonnage", 0) or 0)
+            l = float(item.get("lowerTonnage", 0) or 0)
+            self.assertFalse(
+                u > eps and l > eps,
+                msg=(
+                    f"Rulo {item['rollId']} · Sipariş {item['orderId']}: "
+                    f"aynı rulo aynı siparişte hem üst ({u}) hem alt ({l}) olamaz"
+                ),
+            )
+
     def test_surface_factor_two_small_orders_still_feasible(self):
         """Düşük m² siparişlerde surface_factor=2 ve min iki rulo ile çözüm bulunabilmeli."""
         orders = _make_orders([30, 25], panel_width=1.0, panel_length=1.0)
