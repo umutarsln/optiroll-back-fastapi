@@ -5,13 +5,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import logging
-from fastapi import FastAPI, HTTPException
+import time
+from collections import defaultdict
+from threading import Lock
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Optional
 import uuid
 import os
@@ -43,12 +46,43 @@ from supabase_client import (
     update_report_url,
     list_runs,
     get_run_by_file_id,
+    insert_customer_request,
+    list_customer_requests,
+    get_customer_request,
+    update_customer_request,
+    set_customer_request_converted,
+    delete_customer_request,
 )
 
 app = FastAPI(title="Kesme Stoku Optimizasyon API")
 
 # Optimizasyon tek senaryo: sipariş m² tek yüzey, talep her zaman çift yüzey (2x) ile hesaplanır.
 SURFACE_FACTOR_OPTIMIZE = 2.0
+
+# POST /api/customer-requests için IP başına pencere içi istek sınırı (bellek içi; çok işçili ortamda paylaşılmaz).
+_customer_request_rate_times: Dict[str, List[float]] = defaultdict(list)
+_customer_request_rate_lock = Lock()
+_CUSTOMER_REQUEST_RATE_WINDOW_SEC = 60.0
+_CUSTOMER_REQUEST_RATE_MAX = 20
+
+
+def _enforce_customer_request_post_rate_limit(request: Request) -> None:
+    """
+    Halka açık talep formunu basit IP bazlı rate limit ile korur.
+    """
+    if request.client is None:
+        return
+    ip = request.client.host or "unknown"
+    now = time.monotonic()
+    with _customer_request_rate_lock:
+        times = _customer_request_rate_times[ip]
+        times[:] = [t for t in times if now - t < _CUSTOMER_REQUEST_RATE_WINDOW_SEC]
+        if len(times) >= _CUSTOMER_REQUEST_RATE_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail="Çok fazla istek. Lütfen bir süre sonra tekrar deneyin.",
+            )
+        times.append(now)
 
 
 def _get_run_row_or_http_exception(file_id: str) -> Dict:
@@ -142,6 +176,57 @@ class OrderCreateUpdate(BaseModel):
     bitis_tarihi: Optional[str] = None
     aciklama: Optional[str] = None
     status: Optional[str] = "Pending"
+
+
+class CustomerRequestCreate(BaseModel):
+    """Halka açık teklif talebi formu gövdesi."""
+
+    firma_adi: str = Field(..., min_length=1, max_length=500)
+    yetkili_adi: str = Field(..., min_length=1, max_length=200)
+    email: str = Field(..., min_length=3, max_length=320)
+    telefon: str = Field(..., min_length=6, max_length=50)
+    m2: float
+    panel_width: float
+    panel_length: float = 1.0
+    il: Optional[str] = Field(None, max_length=100)
+    bitis_tarihi: Optional[str] = None
+    musteri_notu: Optional[str] = Field(None, max_length=5000)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email_format(cls, v: str) -> str:
+        """E-postayı trimler ve basit biçim doğrulaması yapar (email-validator bağımlılığı olmadan)."""
+        s = (v or "").strip().lower()
+        if "@" not in s or s.startswith("@") or s.endswith("@") or s.count("@") != 1:
+            raise ValueError("Geçerli bir e-posta girin")
+        local, _, domain = s.partition("@")
+        if len(local) < 1 or len(domain) < 3 or "." not in domain:
+            raise ValueError("Geçerli bir e-posta girin")
+        return s
+
+    @field_validator("telefon")
+    @classmethod
+    def validate_telefon_trim(cls, v: str) -> str:
+        """Telefonu trimler; en az 6 karakter olmalıdır."""
+        t = (v or "").strip()
+        if len(t) < 6:
+            raise ValueError("Telefon numarası en az 6 karakter olmalıdır")
+        return t
+
+
+class CustomerRequestPatch(BaseModel):
+    """Admin: talep satırı kısmi güncelleme."""
+
+    status: Optional[str] = None
+    admin_notu: Optional[str] = None
+    tahmini_teklif: Optional[str] = None
+
+    @model_validator(mode="after")
+    def at_least_one_field(self) -> "CustomerRequestPatch":
+        """En az bir alan dolu olmalıdır."""
+        if self.status is None and self.admin_notu is None and self.tahmini_teklif is None:
+            raise ValueError("En az bir alan (status, admin_notu, tahmini_teklif) gönderilmelidir")
+        return self
 
 
 class ConfigurationSaveRequest(BaseModel):
@@ -512,6 +597,124 @@ async def get_configuration_endpoint(configuration_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="Konfigürasyon bulunamadı")
     return row
+
+
+@app.post("/api/customer-requests")
+async def create_customer_request_endpoint(body: CustomerRequestCreate, request: Request):
+    """
+    Müşteri teklif talebini kaydeder (giriş gerektirmez; rate limit uygulanır).
+    """
+    _enforce_customer_request_post_rate_limit(request)
+    if body.m2 <= 0:
+        raise HTTPException(status_code=400, detail="m² 0'dan büyük olmalıdır")
+    if body.panel_width <= 0:
+        raise HTTPException(status_code=400, detail="Panel genişliği 0'dan büyük olmalıdır")
+    if body.panel_length <= 0:
+        raise HTTPException(status_code=400, detail="Panel uzunluğu 0'dan büyük olmalıdır")
+    try:
+        row = insert_customer_request(
+            firma_adi=body.firma_adi,
+            yetkili_adi=body.yetkili_adi,
+            email=body.email,
+            telefon=body.telefon,
+            m2=body.m2,
+            panel_width=body.panel_width,
+            panel_length=body.panel_length,
+            il=body.il,
+            bitis_tarihi=body.bitis_tarihi,
+            musteri_notu=body.musteri_notu,
+            status="submitted",
+        )
+        return {"customerRequest": row}
+    except SupabaseWriteError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
+@app.get("/api/customer-requests")
+async def list_customer_requests_endpoint(status: Optional[str] = None):
+    """
+    Müşteri taleplerini listeler. Dashboard girişi istemci tarafında; API anahtarı şimdilik kullanılmıyor.
+    """
+    return {"customerRequests": list_customer_requests(status_filter=status)}
+
+
+@app.patch("/api/customer-requests/{request_id}")
+async def patch_customer_request_endpoint(request_id: str, body: CustomerRequestPatch):
+    """
+    Talep durumu veya admin alanlarını günceller.
+    """
+    existing = get_customer_request(request_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Talep bulunamadı")
+    try:
+        updated = update_customer_request(
+            request_id,
+            status=body.status,
+            admin_notu=body.admin_notu,
+            tahmini_teklif=body.tahmini_teklif,
+        )
+        return {"customerRequest": updated}
+    except SupabaseWriteError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
+@app.post("/api/customer-requests/{request_id}/convert-to-order")
+async def convert_customer_request_endpoint(request_id: str, body: OrderCreateUpdate):
+    """
+    Talebi onaylayıp sipariş satırı oluşturur ve talebi converted olarak işaretler.
+    """
+    existing = get_customer_request(request_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Talep bulunamadı")
+    st = (existing.get("status") or "").lower()
+    if st == "converted":
+        raise HTTPException(status_code=400, detail="Bu talep zaten siparişe dönüştürülmüş")
+    if st == "rejected":
+        raise HTTPException(status_code=400, detail="Reddedilmiş talep siparişe dönüştürülemez")
+    if not (body.order_id or "").strip():
+        raise HTTPException(status_code=400, detail="Sipariş adı (order_id) zorunludur")
+    if body.m2 <= 0:
+        raise HTTPException(status_code=400, detail="m² 0'dan büyük olmalıdır")
+    if body.panel_width <= 0:
+        raise HTTPException(status_code=400, detail="Panel genişliği 0'dan büyük olmalıdır")
+    if (body.panel_length or 1) <= 0:
+        raise HTTPException(status_code=400, detail="Panel uzunluğu 0'dan büyük olmalıdır")
+    try:
+        order_row = save_order(
+            order_id=body.order_id.strip(),
+            m2=body.m2,
+            panel_width=body.panel_width,
+            panel_length=body.panel_length or 1.0,
+            il=body.il,
+            bitis_tarihi=body.bitis_tarihi,
+            aciklama=body.aciklama,
+            status=body.status or "Pending",
+            id=None,
+        )
+        oid = order_row.get("id")
+        if not oid:
+            raise HTTPException(status_code=500, detail="Sipariş oluşturuldu ancak id alınamadı")
+        req_row = set_customer_request_converted(request_id, str(oid))
+        return {"order": order_row, "customerRequest": req_row}
+    except SupabaseWriteError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
+@app.delete("/api/customer-requests/{request_id}")
+async def delete_customer_request_endpoint(request_id: str):
+    """
+    Yalnızca durumu 'rejected' olan müşteri talebini kalıcı olarak siler.
+    """
+    existing = get_customer_request(request_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Talep bulunamadı")
+    if (existing.get("status") or "").lower() != "rejected":
+        raise HTTPException(status_code=400, detail="Sadece reddedilmiş talepler silinebilir")
+    try:
+        delete_customer_request(request_id)
+        return {"ok": True}
+    except SupabaseWriteError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
 
 
 @app.get("/api/orders")

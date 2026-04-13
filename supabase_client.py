@@ -694,6 +694,216 @@ def delete_order(order_id: str) -> bool:
         return False
 
 
+def insert_customer_request(
+    *,
+    firma_adi: str,
+    yetkili_adi: str,
+    email: str,
+    telefon: str,
+    m2: float,
+    panel_width: float,
+    panel_length: float = 1.0,
+    il: Optional[str] = None,
+    bitis_tarihi: Optional[str] = None,
+    musteri_notu: Optional[str] = None,
+    status: str = "submitted",
+) -> Dict:
+    """
+    Web formundan gelen müşteri teklif talebini customer_requests tablosuna ekler.
+
+    Args:
+        firma_adi: Firma veya proje adı
+        yetkili_adi: İletişim kişisi
+        email: E-posta
+        telefon: Telefon (zorunlu)
+        m2: Talep m²
+        panel_width: Panel genişliği (m)
+        panel_length: Panel kesim uzunluğu (m)
+        il: İl (opsiyonel)
+        bitis_tarihi: İstenen teslim/bitiş tarihi ISO veya YYYY-MM-DD (opsiyonel)
+        musteri_notu: Müşteri açıklaması (opsiyonel)
+        status: Başlangıç durumu (varsayılan submitted)
+
+    Returns:
+        Oluşturulan talep satırı
+
+    Raises:
+        SupabaseWriteError: Supabase yok veya yazma hatası
+    """
+    client = get_supabase_client()
+    if not client:
+        raise SupabaseWriteError(_msg_supabase_required_for_writes(), status_code=503)
+    try:
+        row = {
+            "firma_adi": firma_adi.strip(),
+            "yetkili_adi": yetkili_adi.strip(),
+            "email": email.strip().lower(),
+            "telefon": telefon.strip(),
+            "m2": float(m2),
+            "panel_width": float(panel_width),
+            "panel_length": float(panel_length),
+            "il": il.strip() if il else None,
+            "bitis_tarihi": bitis_tarihi if bitis_tarihi else None,
+            "musteri_notu": musteri_notu.strip() if musteri_notu else None,
+            "status": status,
+        }
+        resp = client.table("customer_requests").insert(row).execute()
+        if resp.data and len(resp.data) > 0:
+            return resp.data[0]
+        raise SupabaseWriteError(
+            "Talep kaydedilemedi (boş yanıt). customer_requests tablosunu kontrol edin.",
+            status_code=502,
+        )
+    except SupabaseWriteError:
+        raise
+    except Exception as e:
+        logger.exception("Müşteri talebi eklenemedi: %s", str(e))
+        code = 503 if _is_network_related_error(e) else 502
+        hint = " Veritabanına ulaşılamıyor; SUPABASE_URL ve ağı kontrol edin." if code == 503 else ""
+        raise SupabaseWriteError(f"Müşteri talebi eklenemedi: {e!s}.{hint}", status_code=code) from e
+
+
+def list_customer_requests(status_filter: Optional[str] = None) -> List[Dict]:
+    """
+    Müşteri teklif taleplerini listeler (yeniden eskiye).
+
+    Args:
+        status_filter: Opsiyonel status eşitliği (örn. submitted)
+
+    Returns:
+        Talep satırları; Supabase yoksa boş liste
+    """
+    client = get_supabase_client()
+    if not client:
+        return []
+    try:
+        query = client.table("customer_requests").select("*").order("created_at", desc=True)
+        if status_filter:
+            query = query.eq("status", status_filter)
+        resp = query.execute()
+        return resp.data or []
+    except Exception as e:
+        _log_supabase_transport_error("list_customer_requests", e)
+        return []
+
+
+def get_customer_request(request_id: str) -> Optional[Dict]:
+    """
+    Tek bir müşteri talebini id ile getirir.
+
+    Args:
+        request_id: Talep UUID
+
+    Returns:
+        Satır veya bulunamazsa None
+    """
+    client = get_supabase_client()
+    if not client:
+        return None
+    try:
+        resp = client.table("customer_requests").select("*").eq("id", request_id).limit(1).execute()
+        if resp.data and len(resp.data) > 0:
+            return resp.data[0]
+    except Exception as e:
+        _log_supabase_transport_error("get_customer_request", e)
+    return None
+
+
+def update_customer_request(
+    request_id: str,
+    *,
+    status: Optional[str] = None,
+    admin_notu: Optional[str] = None,
+    tahmini_teklif: Optional[str] = None,
+    converted_order_id: Optional[str] = None,
+) -> Dict:
+    """
+    Müşteri talebini günceller (admin notu, durum, sipariş bağlantısı).
+
+    Args:
+        request_id: Talep UUID
+        status: Yeni durum (opsiyonel)
+        admin_notu: İç not (opsiyonel)
+        tahmini_teklif: Tahmini teklif metni (opsiyonel)
+        converted_order_id: Dönüştürülen sipariş UUID (opsiyonel)
+
+    Returns:
+        Güncellenmiş satır
+
+    Raises:
+        SupabaseWriteError: Kayıt yok veya yazma hatası
+    """
+    client = get_supabase_client()
+    if not client:
+        raise SupabaseWriteError(_msg_supabase_required_for_writes(), status_code=503)
+    row: Dict[str, Any] = {"updated_at": datetime.now(timezone.utc).isoformat()}
+    if status is not None:
+        row["status"] = status
+    if admin_notu is not None:
+        row["admin_notu"] = admin_notu
+    if tahmini_teklif is not None:
+        row["tahmini_teklif"] = tahmini_teklif
+    if converted_order_id is not None:
+        row["converted_order_id"] = converted_order_id
+    try:
+        resp = client.table("customer_requests").update(row).eq("id", request_id).execute()
+        if resp.data and len(resp.data) > 0:
+            return resp.data[0]
+        raise SupabaseWriteError(
+            "Talep güncellenemedi: kayıt bulunamadı veya yetki/RLS engeli.",
+            status_code=404,
+        )
+    except SupabaseWriteError:
+        raise
+    except Exception as e:
+        logger.exception("Müşteri talebi güncellenemedi: %s", str(e))
+        code = 503 if _is_network_related_error(e) else 502
+        hint = " Veritabanına ulaşılamıyor; SUPABASE_URL ve ağı kontrol edin." if code == 503 else ""
+        raise SupabaseWriteError(f"Müşteri talebi güncellenemedi: {e!s}.{hint}", status_code=code) from e
+
+
+def set_customer_request_converted(request_id: str, order_uuid: str) -> Dict:
+    """
+    Talebi 'converted' yapar ve oluşan sipariş satırına bağlar.
+
+    Args:
+        request_id: Talep UUID
+        order_uuid: orders.id (UUID)
+
+    Returns:
+        Güncellenmiş talep satırı
+    """
+    return update_customer_request(
+        request_id,
+        status="converted",
+        converted_order_id=order_uuid,
+    )
+
+
+def delete_customer_request(request_id: str) -> None:
+    """
+    Müşteri talebi satırını veritabanından siler (yalnızca reddedilmiş kayıtlar için API katmanında kısıtlanmalıdır).
+
+    Args:
+        request_id: Silinecek talep UUID
+
+    Raises:
+        SupabaseWriteError: Supabase yok veya silme başarısız
+    """
+    client = get_supabase_client()
+    if not client:
+        raise SupabaseWriteError(_msg_supabase_required_for_writes(), status_code=503)
+    try:
+        client.table("customer_requests").delete().eq("id", request_id).execute()
+    except SupabaseWriteError:
+        raise
+    except Exception as e:
+        logger.exception("Müşteri talebi silinemedi: %s", str(e))
+        code = 503 if _is_network_related_error(e) else 502
+        hint = " Veritabanına ulaşılamıyor; SUPABASE_URL ve ağı kontrol edin." if code == 503 else ""
+        raise SupabaseWriteError(f"Müşteri talebi silinemedi: {e!s}.{hint}", status_code=code) from e
+
+
 def list_stock_rolls() -> List[Dict]:
     """
     Kayıtlı stok rulolarını listeler.
