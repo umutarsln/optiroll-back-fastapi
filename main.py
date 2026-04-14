@@ -13,9 +13,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Literal, Tuple
 import uuid
 import os
 from optimizer import (
@@ -163,6 +163,15 @@ class OptimizeRequest(BaseModel):
     saveToDb: Optional[bool] = True  # False ise sadece hesaplama, DB'ye kaydetmez
     description: Optional[str] = None  # Kısa açıklama; sonuçlar tablosunda ID yerine gösterilir
     stock_roll_ids: Optional[List[str]] = Field(None, alias="stockRollIds")
+    strategy_modes: Optional[List[Literal["az", "orta", "cok", "eszamanli"]]] = Field(
+        None,
+        alias="strategyModes",
+    )
+    sync_level: Optional[Literal["serbest", "dengeli", "siki"]] = Field(None, alias="syncLevel")
+    sync_levels: Optional[List[Literal["serbest", "dengeli", "siki"]]] = Field(
+        None,
+        alias="syncLevels",
+    )
 
 
 class OrderCreateUpdate(BaseModel):
@@ -290,6 +299,79 @@ class RollStatusItem(BaseModel):
     ordersUsed: int
 
 
+class ModeComparisonItem(BaseModel):
+    """Çok modlu çalıştırmada her strateji için özet karşılaştırma satırı."""
+
+    mode: Literal["az", "orta", "cok", "eszamanli"]
+    status: str
+    objective: float
+    totalCost: Optional[float] = None
+    totalFire: Optional[float] = None
+    totalStock: Optional[float] = None
+    openedRolls: Optional[int] = None
+    rollChangeCount: Optional[int] = None
+    surfaceSyncViolations: Optional[int] = None
+
+
+class SyncComparisonItem(BaseModel):
+    """Senkron seviye bazlı kısa karşılaştırma satırı."""
+
+    syncLevel: Literal["serbest", "dengeli", "siki"]
+    status: str
+    totalCost: Optional[float] = None
+    totalFire: Optional[float] = None
+    rollChangeCount: Optional[int] = None
+    synchronousChanges: Optional[int] = None
+    independentChanges: Optional[int] = None
+
+
+class LineEventItem(BaseModel):
+    """Üst/alt hat üzerinde tek bir tak-çıkar/devam olayı."""
+
+    timestampStep: int
+    line: Literal["ust", "alt"]
+    action: Literal["tak", "cikar", "devam"]
+    rollId: int
+    orderIdFrom: Optional[int] = None
+    orderIdTo: Optional[int] = None
+
+
+class LineTransitionsSummary(BaseModel):
+    """Hat değişim özet metrikleri."""
+
+    totalChanges: int = 0
+    synchronousChanges: int = 0
+    independentChanges: int = 0
+    stepCount: int = 0
+
+
+class LineScheduleCutItem(BaseModel):
+    """Tek adımda kesilen sipariş parçası."""
+
+    orderId: int
+    rollId: int
+    tonnage: float
+    m2: float
+    upperTonnage: float = 0.0
+    lowerTonnage: float = 0.0
+
+
+class LineScheduleStepItem(BaseModel):
+    """Tek hat adımı: üst/alt rulo durumu ve o adımda kesilen parçalar."""
+
+    step: int
+    orderId: int
+    upperRollId: Optional[int] = None
+    lowerRollId: Optional[int] = None
+    upperAction: Optional[str] = None
+    lowerAction: Optional[str] = None
+    orderAction: Optional[str] = None
+    actionSummary: Optional[str] = None
+    prevUpperRollId: Optional[int] = None
+    prevLowerRollId: Optional[int] = None
+    cuts: List[LineScheduleCutItem] = Field(default_factory=list)
+
+
 class OptimizeResponse(BaseModel):
     status: str
     objective: float
@@ -300,12 +382,205 @@ class OptimizeResponse(BaseModel):
     sequencePenalty: float = 0.0
     sequenceViolations: List[SequenceViolationItem] = Field(default_factory=list)
     rollOrderSequences: Dict[str, List[int]] = Field(default_factory=dict)
+    selectedModes: List[Literal["az", "orta", "cok", "eszamanli"]] = Field(default_factory=list)
+    selectedModesCount: int = 0
+    comparisonEnabled: bool = False
+    modeComparisons: List[ModeComparisonItem] = Field(default_factory=list)
+    selectedSyncLevels: List[Literal["serbest", "dengeli", "siki"]] = Field(default_factory=list)
+    selectedSyncLevelsCount: int = 0
+    syncComparisons: List[SyncComparisonItem] = Field(default_factory=list)
+    lineEvents: List[LineEventItem] = Field(default_factory=list)
+    lineSchedule: List[LineScheduleStepItem] = Field(default_factory=list)
+    lineTransitionsSummary: LineTransitionsSummary = Field(default_factory=LineTransitionsSummary)
 
 
 @app.get("/")
 async def root():
     """API root endpoint"""
     return {"message": "Kesme Stoku Optimizasyon API", "version": "1.0.0"}
+
+
+def _resolve_strategy_modes(request: OptimizeRequest) -> List[Literal["az", "orta", "cok", "eszamanli"]]:
+    """
+    İstekten çalıştırılacak strateji modlarını normalize eder.
+
+    Args:
+        request: Optimize isteği
+
+    Returns:
+        Sırası korunmuş, tekrarsız mod listesi
+    """
+    requested = request.strategy_modes or []
+    valid: List[Literal["az", "orta", "cok", "eszamanli"]] = []
+    seen = set()
+    for mode in requested:
+        if mode in seen:
+            continue
+        seen.add(mode)
+        valid.append(mode)
+    return valid
+
+
+def _resolve_sync_levels(request: OptimizeRequest) -> List[Literal["serbest", "dengeli", "siki"]]:
+    """
+    İstekten çalıştırılacak senkron seviyelerini normalize eder.
+    """
+    requested = request.sync_levels or ([request.sync_level] if request.sync_level else [])
+    valid: List[Literal["serbest", "dengeli", "siki"]] = []
+    seen = set()
+    for level in requested:
+        if level in seen:
+            continue
+        seen.add(level)
+        valid.append(level)
+    return valid
+
+
+def _build_sync_profile(level: Literal["serbest", "dengeli", "siki"]) -> Dict[str, float | int | bool | str]:
+    """
+    Senkron seviyesine göre çözücü ayarlarını döner.
+    """
+    if level == "siki":
+        return {
+            "sync_level": "siki",
+            "enforce_surface_sync": True,
+            "sync_penalty_weight": 0.0,
+        }
+    if level == "dengeli":
+        return {
+            "sync_level": "dengeli",
+            "enforce_surface_sync": False,
+            "sync_penalty_weight": 45.0,
+        }
+    return {
+        "sync_level": "serbest",
+        "enforce_surface_sync": False,
+        "sync_penalty_weight": 0.0,
+    }
+
+
+def _build_sync_comparison_item(
+    level: Literal["serbest", "dengeli", "siki"],
+    status: str,
+    results: Optional[Dict],
+) -> SyncComparisonItem:
+    """
+    Senkron seviye sonucu için kısa karşılaştırma satırı üretir.
+    """
+    if results is None:
+        return SyncComparisonItem(syncLevel=level, status=status)
+    summary = results.get("summary") or {}
+    trans = results.get("lineTransitionsSummary") or {}
+    return SyncComparisonItem(
+        syncLevel=level,
+        status=status,
+        totalCost=float(summary.get("totalCost", 0.0) or 0.0),
+        totalFire=float(summary.get("totalFire", 0.0) or 0.0),
+        rollChangeCount=int(summary.get("rollChangeCount", 0) or 0),
+        synchronousChanges=int(trans.get("synchronousChanges", 0) or 0),
+        independentChanges=int(trans.get("independentChanges", 0) or 0),
+    )
+
+
+def _build_mode_profile(
+    mode: Literal["az", "orta", "cok", "eszamanli"],
+    request: OptimizeRequest,
+) -> Dict[str, float | int | bool]:
+    """
+    Strateji adına göre çözücü parametre profilini üretir.
+
+    Args:
+        mode: Çalıştırılacak strateji modu
+        request: Kullanıcı isteği
+
+    Returns:
+        solve_optimization için profil parametreleri
+    """
+    base_max_orders = int(request.rollSettings.maxOrdersPerRoll)
+    base_max_rolls = int(request.rollSettings.maxRollsPerOrder)
+    base_fire = float(request.costs.fireCost)
+    base_setup = float(request.costs.setupCost)
+    base_stock = float(request.costs.stockCost)
+    base_max_interleaving = int(request.maxInterleavingOrders if request.maxInterleavingOrders is not None else 2)
+    base_penalty = float(request.interleavingPenaltyCost or 0.0)
+
+    if mode == "az":
+        return {
+            "max_orders_per_roll": max(1, min(base_max_orders, 2)),
+            "max_rolls_per_order": max(2, min(base_max_rolls, 4)),
+            "fire_cost": base_fire * 0.85,
+            "setup_cost": max(1.0, base_setup * 1.8),
+            "stock_cost": base_stock,
+            "max_interleaving_orders": max(0, min(base_max_interleaving, 1)),
+            "interleaving_penalty_cost": max(base_penalty, base_setup * 0.7),
+            "enforce_surface_sync": False,
+        }
+    if mode == "cok":
+        return {
+            "max_orders_per_roll": max(base_max_orders, 4),
+            "max_rolls_per_order": max(base_max_rolls, 8),
+            "fire_cost": base_fire * 1.25,
+            "setup_cost": max(0.1, base_setup * 0.65),
+            "stock_cost": base_stock,
+            "max_interleaving_orders": max(base_max_interleaving, 4),
+            "interleaving_penalty_cost": max(0.0, base_penalty * 0.6),
+            "enforce_surface_sync": False,
+        }
+    if mode == "eszamanli":
+        return {
+            "max_orders_per_roll": max(1, min(base_max_orders, 3)),
+            "max_rolls_per_order": max(2, min(base_max_rolls, 6)),
+            "fire_cost": base_fire,
+            "setup_cost": max(1.0, base_setup * 1.2),
+            "stock_cost": base_stock,
+            "max_interleaving_orders": max(0, min(base_max_interleaving, 1)),
+            "interleaving_penalty_cost": max(base_penalty, base_setup),
+            "enforce_surface_sync": True,
+        }
+    return {
+        "max_orders_per_roll": max(1, base_max_orders),
+        "max_rolls_per_order": max(2, base_max_rolls),
+        "fire_cost": base_fire,
+        "setup_cost": base_setup,
+        "stock_cost": base_stock,
+        "max_interleaving_orders": max(0, base_max_interleaving),
+        "interleaving_penalty_cost": max(0.0, base_penalty),
+        "enforce_surface_sync": False,
+    }
+
+
+def _build_mode_comparison_item(
+    mode: Literal["az", "orta", "cok", "eszamanli"],
+    status: str,
+    results: Optional[Dict],
+) -> ModeComparisonItem:
+    """
+    Çözüm sonucunu frontend için sabit şemalı karşılaştırma satırına dönüştürür.
+
+    Args:
+        mode: Strateji modu
+        status: Solver durumu
+        results: Çözücü çıktı sözlüğü
+
+    Returns:
+        ModeComparisonItem
+    """
+    if results is None:
+        return ModeComparisonItem(mode=mode, status=status, objective=0.0)
+    summary = results.get("summary") or {}
+    return ModeComparisonItem(
+        mode=mode,
+        status=status,
+        objective=float(results.get("objective", 0.0) or 0.0),
+        totalCost=float(summary.get("totalCost", 0.0) or 0.0),
+        totalFire=float(summary.get("totalFire", 0.0) or 0.0),
+        totalStock=float(summary.get("totalStock", 0.0) or 0.0),
+        openedRolls=int(summary.get("openedRolls", 0) or 0),
+        rollChangeCount=int(results.get("rollChangeCount", summary.get("rollChangeCount", 0)) or 0),
+        surfaceSyncViolations=int(
+            results.get("surfaceSyncViolations", summary.get("surfaceSyncViolations", 0)) or 0
+        ),
+    )
 
 
 @app.post("/api/optimize", response_model=OptimizeResponse)
@@ -389,43 +664,138 @@ async def optimize(request: OptimizeRequest):
             logger.warning("[400] %s", detail)
             raise HTTPException(status_code=400, detail=detail)
 
-        # Optimizasyonu çöz (2 dk timeout); panel uzunluğu ile kesim: uzunluk ve katları
-        status, results = solve_optimization(
-            thickness=request.material.thickness,
-            density=request.material.density,
-            orders=orders_list,
-            panel_widths=panel_widths,
-            panel_lengths=panel_lengths,
-            rolls=rolls,
-            max_orders_per_roll=request.rollSettings.maxOrdersPerRoll,
-            max_rolls_per_order=request.rollSettings.maxRollsPerOrder,
-            fire_cost=request.costs.fireCost,
-            setup_cost=request.costs.setupCost,
-            stock_cost=request.costs.stockCost,
-            time_limit_seconds=120,
-            surface_factor=SURFACE_FACTOR_OPTIMIZE,
-            require_dual_roll_allocation=False,
-            max_interleaving_orders=int(
-                request.maxInterleavingOrders
-                if request.maxInterleavingOrders is not None
-                else 2
-            ),
-            interleaving_penalty_cost=float(request.interleavingPenaltyCost or 0.0),
-        )
-        
-        if status != 'Optimal' or results is None:
-            detail_msg = f"Optimizasyon çözülemedi. Durum: {status}"
-            if status == 'Infeasible':
-                detail_msg += (
-                    " Olası nedenler: çift yüzeyde her sipariş için üst ve alt yüzey tonajı ayrı ayrı tam D/2 olmalı; "
-                    "en az iki rulo; yeterli toplam kapasite; max sipariş/rulo veya max rulo/sipariş; min. lot / kurulum."
-                )
-            logger.warning(
-                "[400] Optimizasyon hatası: status=%s | tonaj=%s, rulo_sayisi=%s, ihtiyaç=%s, maxOrdersPerRoll=%s, maxRollsPerOrder=%s",
-                status, total_roll_tonnage, len(rolls), total_tonnage_needed,
-                request.rollSettings.maxOrdersPerRoll, request.rollSettings.maxRollsPerOrder
+        selected_modes = _resolve_strategy_modes(request)
+        selected_sync_levels = _resolve_sync_levels(request)
+        if len(selected_sync_levels) == 0:
+            logger.warning("[400] Senkron seviye seçimi boş geldi")
+            raise HTTPException(status_code=400, detail="En az bir senkron seviyesi seçin")
+
+        # Senkron seviyeleri için karşılaştırma (mod seçiminden bağımsız baz profil: orta).
+        anchor_profile = _build_mode_profile("orta", request)
+        sync_status_results: List[Tuple[Literal["serbest", "dengeli", "siki"], str, Optional[Dict]]] = []
+        sync_comparisons: List[SyncComparisonItem] = []
+        for level in selected_sync_levels:
+            sync_profile = _build_sync_profile(level)
+            status, results = solve_optimization(
+                thickness=request.material.thickness,
+                density=request.material.density,
+                orders=orders_list,
+                panel_widths=panel_widths,
+                panel_lengths=panel_lengths,
+                rolls=rolls,
+                max_orders_per_roll=int(anchor_profile["max_orders_per_roll"]),
+                max_rolls_per_order=int(anchor_profile["max_rolls_per_order"]),
+                fire_cost=float(anchor_profile["fire_cost"]),
+                setup_cost=float(anchor_profile["setup_cost"]),
+                stock_cost=float(anchor_profile["stock_cost"]),
+                time_limit_seconds=120,
+                surface_factor=SURFACE_FACTOR_OPTIMIZE,
+                require_dual_roll_allocation=False,
+                max_interleaving_orders=int(anchor_profile["max_interleaving_orders"]),
+                interleaving_penalty_cost=float(anchor_profile["interleaving_penalty_cost"]),
+                enforce_surface_sync=bool(sync_profile["enforce_surface_sync"]),
+                sync_level=str(sync_profile["sync_level"]),
+                sync_penalty_weight=float(sync_profile["sync_penalty_weight"]),
             )
-            raise HTTPException(status_code=400, detail=detail_msg)
+            sync_status_results.append((level, status, results))
+            sync_comparisons.append(_build_sync_comparison_item(level, status, results))
+
+        selected_sync: Optional[Tuple[Literal["serbest", "dengeli", "siki"], str, Optional[Dict]]] = None
+        for item in sync_status_results:
+            if item[0] == "dengeli" and item[1] == "Optimal" and item[2] is not None:
+                selected_sync = item
+                break
+        if selected_sync is None:
+            for item in sync_status_results:
+                if item[1] == "Optimal" and item[2] is not None:
+                    selected_sync = item
+                    break
+        if selected_sync is None:
+            status = sync_status_results[0][1] if sync_status_results else "Infeasible"
+            raise HTTPException(status_code=400, detail=f"Senkron seviyesi için çözüm üretilemedi. Durum: {status}")
+        selected_sync_level, _, _ = selected_sync
+        selected_sync_profile = _build_sync_profile(selected_sync_level)
+
+        # Strateji modu seçiliyse karşılaştırma yap; seçilmediyse baz profil ile tek sonuç üret.
+        mode_status_results: List[Tuple[Literal["az", "orta", "cok", "eszamanli"], str, Optional[Dict]]] = []
+        mode_comparisons: List[ModeComparisonItem] = []
+        selected_mode: Optional[str] = None
+        if len(selected_modes) > 0:
+            for mode in selected_modes:
+                profile = _build_mode_profile(mode, request)
+                status, results = solve_optimization(
+                    thickness=request.material.thickness,
+                    density=request.material.density,
+                    orders=orders_list,
+                    panel_widths=panel_widths,
+                    panel_lengths=panel_lengths,
+                    rolls=rolls,
+                    max_orders_per_roll=int(profile["max_orders_per_roll"]),
+                    max_rolls_per_order=int(profile["max_rolls_per_order"]),
+                    fire_cost=float(profile["fire_cost"]),
+                    setup_cost=float(profile["setup_cost"]),
+                    stock_cost=float(profile["stock_cost"]),
+                    time_limit_seconds=120,
+                    surface_factor=SURFACE_FACTOR_OPTIMIZE,
+                    require_dual_roll_allocation=False,
+                    max_interleaving_orders=int(profile["max_interleaving_orders"]),
+                    interleaving_penalty_cost=float(profile["interleaving_penalty_cost"]),
+                    enforce_surface_sync=bool(selected_sync_profile["enforce_surface_sync"]),
+                    sync_level=str(selected_sync_profile["sync_level"]),
+                    sync_penalty_weight=float(selected_sync_profile["sync_penalty_weight"]),
+                )
+                mode_status_results.append((mode, status, results))
+                mode_comparisons.append(_build_mode_comparison_item(mode, status, results))
+
+            selected: Optional[Tuple[Literal["az", "orta", "cok", "eszamanli"], str, Optional[Dict]]] = None
+            for item in mode_status_results:
+                if item[0] == "orta" and item[1] == "Optimal" and item[2] is not None:
+                    selected = item
+                    break
+            if selected is None:
+                for item in mode_status_results:
+                    if item[1] == "Optimal" and item[2] is not None:
+                        selected = item
+                        break
+            if selected is None:
+                status = mode_status_results[0][1] if mode_status_results else "Infeasible"
+                detail_msg = f"Optimizasyon çözülemedi. Durum: {status}"
+                if status == 'Infeasible':
+                    detail_msg += (
+                        " Olası nedenler: çift yüzeyde her sipariş için üst ve alt yüzey tonajı ayrı ayrı tam D/2 olmalı; "
+                        "en az iki rulo; yeterli toplam kapasite; max sipariş/rulo veya max rulo/sipariş; min. lot / kurulum."
+                    )
+                logger.warning(
+                    "[400] Çok modlu optimizasyon hatası | tonaj=%s, rulo_sayisi=%s, ihtiyaç=%s, maxOrdersPerRoll=%s, maxRollsPerOrder=%s",
+                    total_roll_tonnage, len(rolls), total_tonnage_needed,
+                    request.rollSettings.maxOrdersPerRoll, request.rollSettings.maxRollsPerOrder
+                )
+                raise HTTPException(status_code=400, detail=detail_msg)
+            selected_mode, status, results = selected
+        else:
+            status, results = solve_optimization(
+                thickness=request.material.thickness,
+                density=request.material.density,
+                orders=orders_list,
+                panel_widths=panel_widths,
+                panel_lengths=panel_lengths,
+                rolls=rolls,
+                max_orders_per_roll=int(anchor_profile["max_orders_per_roll"]),
+                max_rolls_per_order=int(anchor_profile["max_rolls_per_order"]),
+                fire_cost=float(anchor_profile["fire_cost"]),
+                setup_cost=float(anchor_profile["setup_cost"]),
+                stock_cost=float(anchor_profile["stock_cost"]),
+                time_limit_seconds=120,
+                surface_factor=SURFACE_FACTOR_OPTIMIZE,
+                require_dual_roll_allocation=False,
+                max_interleaving_orders=int(anchor_profile["max_interleaving_orders"]),
+                interleaving_penalty_cost=float(anchor_profile["interleaving_penalty_cost"]),
+                enforce_surface_sync=bool(selected_sync_profile["enforce_surface_sync"]),
+                sync_level=str(selected_sync_profile["sync_level"]),
+                sync_penalty_weight=float(selected_sync_profile["sync_penalty_weight"]),
+            )
+            if status != "Optimal" or results is None:
+                raise HTTPException(status_code=400, detail=f"Optimizasyon çözülemedi. Durum: {status}")
         
         file_id = uuid.uuid4().hex[:16]
         input_data = {
@@ -442,6 +812,20 @@ async def optimize(request: OptimizeRequest):
             "orders": [o.model_dump() for o in request.orders],
             "rollSettings": request.rollSettings.model_dump(),
             "costs": request.costs.model_dump(),
+            "strategyModes": selected_modes,
+            "selectedModes": selected_modes,
+            "selectedModesCount": len(selected_modes),
+            "comparisonEnabled": len(selected_modes) > 1,
+            "syncLevels": selected_sync_levels,
+            "selectedSyncLevels": selected_sync_levels,
+            "selectedSyncLevelsCount": len(selected_sync_levels),
+            "selectedSyncLevel": selected_sync_level,
+            "selectedMode": selected_mode,
+            "modeComparisons": [item.model_dump() for item in mode_comparisons],
+            "syncComparisons": [item.model_dump() for item in sync_comparisons],
+            "lineEvents": results.get("lineEvents", []),
+            "lineSchedule": results.get("lineSchedule", []),
+            "lineTransitionsSummary": results.get("lineTransitionsSummary", {}),
         }
         if getattr(request, "stock_roll_ids", None) and len(request.stock_roll_ids) > 0:
             input_data["stockRollIds"] = request.stock_roll_ids
@@ -482,6 +866,16 @@ async def optimize(request: OptimizeRequest):
                 SequenceViolationItem(**v) for v in results.get('sequenceViolations', [])
             ],
             rollOrderSequences=dict(results.get('rollOrderSequences') or {}),
+            selectedModes=selected_modes,
+            selectedModesCount=len(selected_modes),
+            comparisonEnabled=len(selected_modes) > 1,
+            modeComparisons=mode_comparisons,
+            selectedSyncLevels=selected_sync_levels,
+            selectedSyncLevelsCount=len(selected_sync_levels),
+            syncComparisons=sync_comparisons,
+            lineEvents=[LineEventItem(**e) for e in results.get("lineEvents", [])],
+            lineSchedule=[LineScheduleStepItem(**s) for s in results.get("lineSchedule", [])],
+            lineTransitionsSummary=LineTransitionsSummary(**(results.get("lineTransitionsSummary") or {})),
         )
         
         return response
@@ -850,6 +1244,14 @@ async def get_run_detail(file_id: str):
     """
     run = _get_run_row_or_http_exception(file_id)
     summary = run.get("summary") or {}
+    input_data = run.get("input_data") or {}
+    selected_modes = input_data.get("selectedModes") or input_data.get("strategyModes") or []
+    selected_sync_levels = input_data.get("selectedSyncLevels") or input_data.get("syncLevels") or []
+    mode_comparisons = input_data.get("modeComparisons") or []
+    sync_comparisons = input_data.get("syncComparisons") or []
+    line_events = input_data.get("lineEvents") or []
+    line_schedule = input_data.get("lineSchedule") or []
+    line_transitions_summary = input_data.get("lineTransitionsSummary") or {}
     return {
         "fileId": run.get("file_id", file_id),
         "status": run.get("status", "Optimal"),
@@ -858,13 +1260,86 @@ async def get_run_detail(file_id: str):
         "cuttingPlan": run.get("cutting_plan") or [],
         "rollStatus": run.get("roll_status") or [],
         "configurationId": run.get("configuration_id"),
-        "inputData": run.get("input_data"),
+        "inputData": input_data,
+        "selectedModes": selected_modes,
+        "selectedModesCount": len(selected_modes),
+        "comparisonEnabled": len(selected_modes) > 1,
+        "modeComparisons": mode_comparisons,
+        "selectedSyncLevels": selected_sync_levels,
+        "selectedSyncLevelsCount": len(selected_sync_levels),
+        "syncComparisons": sync_comparisons,
+        "lineEvents": line_events,
+        "lineSchedule": line_schedule,
+        "lineTransitionsSummary": line_transitions_summary,
         "createdAt": run.get("created_at"),
         "reportUrl": run.get("report_url"),
         "runStatus": run.get("run_status", "saved"),
         "processedAt": run.get("processed_at"),
         "description": run.get("description"),
     }
+
+
+@app.get("/api/runs/{file_id}/mode-comparison.csv")
+async def get_mode_comparison_csv(file_id: str):
+    """
+    Belirli bir çalıştırma için mod karşılaştırma özetini CSV olarak döner.
+    """
+    run = _get_run_row_or_http_exception(file_id)
+    input_data = run.get("input_data") or {}
+    mode_comparisons = input_data.get("modeComparisons") or []
+    if not mode_comparisons:
+        raise HTTPException(status_code=404, detail="Bu çalıştırma için mod karşılaştırma verisi bulunamadı")
+    header = "mode,status,totalCost,totalFire,rollChangeCount,surfaceSyncViolations"
+    rows = [header]
+    for item in mode_comparisons:
+        rows.append(
+            ",".join([
+                str(item.get("mode", "")),
+                str(item.get("status", "")),
+                str(item.get("totalCost", "")),
+                str(item.get("totalFire", "")),
+                str(item.get("rollChangeCount", "")),
+                str(item.get("surfaceSyncViolations", "")),
+            ])
+        )
+    csv_content = "\n".join(rows)
+    return PlainTextResponse(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="mode_comparison_{file_id}.csv"'},
+    )
+
+
+@app.get("/api/runs/{file_id}/sync-comparison.csv")
+async def get_sync_comparison_csv(file_id: str):
+    """
+    Belirli bir çalıştırma için senkron seviye karşılaştırma özetini CSV olarak döner.
+    """
+    run = _get_run_row_or_http_exception(file_id)
+    input_data = run.get("input_data") or {}
+    sync_comparisons = input_data.get("syncComparisons") or []
+    if not sync_comparisons:
+        raise HTTPException(status_code=404, detail="Bu çalıştırma için senkron karşılaştırma verisi bulunamadı")
+    header = "syncLevel,status,totalCost,totalFire,rollChangeCount,synchronousChanges,independentChanges"
+    rows = [header]
+    for item in sync_comparisons:
+        rows.append(
+            ",".join([
+                str(item.get("syncLevel", "")),
+                str(item.get("status", "")),
+                str(item.get("totalCost", "")),
+                str(item.get("totalFire", "")),
+                str(item.get("rollChangeCount", "")),
+                str(item.get("synchronousChanges", "")),
+                str(item.get("independentChanges", "")),
+            ])
+        )
+    csv_content = "\n".join(rows)
+    return PlainTextResponse(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="sync_comparison_{file_id}.csv"'},
+    )
 
 
 @app.delete("/api/runs/{file_id}")

@@ -11,8 +11,8 @@ from openpyxl.styles import Font, Alignment, PatternFill
 from datetime import datetime
 import os
 import random
-from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
+from collections import defaultdict, deque
+from typing import Dict, List, Tuple, Optional, Set
 import logging
 from pydantic import BaseModel
 
@@ -229,6 +229,806 @@ def apply_sequence_local_improvement(
     return new_rows, seq
 
 
+def _partition_order_slices_for_surfaces(order_rows: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Bir siparişe ait kesim satırlarını üst/alt yüzey listelerine ayırır.
+    Modelden gelen upperTonnage/lowerTonnage varsa doğrudan kullanır; yoksa ton dengelemeli yedek ayırım yapar.
+
+    Args:
+        order_rows: Aynı orderId için kesim satırları
+
+    Returns:
+        (upper_rows, lower_rows)
+    """
+    has_model_split = any(
+        (float(r.get("upperTonnage") or 0.0) > 1e-9) or (float(r.get("lowerTonnage") or 0.0) > 1e-9)
+        for r in order_rows
+    )
+    if has_model_split:
+        upper_rows = [r for r in order_rows if float(r.get("upperTonnage") or 0.0) > 1e-9]
+        lower_rows = [r for r in order_rows if float(r.get("lowerTonnage") or 0.0) > 1e-9]
+        upper_rows.sort(key=lambda r: int(r["rollId"]))
+        lower_rows.sort(key=lambda r: int(r["rollId"]))
+        return upper_rows, lower_rows
+
+    sorted_rows = sorted(order_rows, key=lambda r: float(r.get("tonnage") or 0.0), reverse=True)
+    upper_rows: List[Dict] = []
+    lower_rows: List[Dict] = []
+    upper_sum = 0.0
+    lower_sum = 0.0
+    for row in sorted_rows:
+        ton = float(row.get("tonnage") or 0.0)
+        if upper_sum <= lower_sum:
+            upper_rows.append(row)
+            upper_sum += ton
+        else:
+            lower_rows.append(row)
+            lower_sum += ton
+    upper_rows.sort(key=lambda r: int(r["rollId"]))
+    lower_rows.sort(key=lambda r: int(r["rollId"]))
+    return upper_rows, lower_rows
+
+
+def calculate_roll_change_and_sync_metrics(cutting_plan: List[Dict]) -> Dict[str, int]:
+    """
+    Kesim planından operatör odaklı rulo değişim ve üst/alt eşzamanlılık metriklerini üretir.
+
+    Args:
+        cutting_plan: Çözümden çıkan kesim planı satırları
+
+    Returns:
+        {"rollChangeCount": int, "surfaceSyncViolations": int}
+    """
+    by_order: Dict[int, List[Dict]] = defaultdict(list)
+    for row in cutting_plan:
+        by_order[int(row["orderId"])].append(row)
+
+    roll_change_count = 0
+    surface_sync_violations = 0
+    for order_rows in by_order.values():
+        upper_rows, lower_rows = _partition_order_slices_for_surfaces(order_rows)
+        upper_changes = max(0, len(upper_rows) - 1)
+        lower_changes = max(0, len(lower_rows) - 1)
+        roll_change_count += upper_changes + lower_changes
+        if len(upper_rows) != len(lower_rows):
+            surface_sync_violations += abs(len(upper_rows) - len(lower_rows))
+
+    return {
+        "rollChangeCount": int(roll_change_count),
+        "surfaceSyncViolations": int(surface_sync_violations),
+    }
+
+
+def build_line_events(line_schedule: List[Dict]) -> Tuple[List[Dict], Dict[str, int]]:
+    """
+    Adım çizelgesinden üst/alt hatlar için kronolojik rulo tak-çıkar ve sipariş geçiş olaylarını üretir.
+
+    Args:
+        line_schedule: build_line_schedule çıktısı
+
+    Returns:
+        (line_events, line_transition_summary)
+    """
+    line_events: List[Dict] = []
+    prev_upper: Optional[int] = None
+    prev_lower: Optional[int] = None
+    prev_order: Optional[int] = None
+    total_changes = 0
+    synchronous_changes = 0
+    independent_changes = 0
+    for step_row in line_schedule:
+        step = int(step_row["step"])
+        oid = int(step_row["orderId"])
+        upper_id = int(step_row["upperRollId"]) if step_row.get("upperRollId") is not None else None
+        lower_id = int(step_row["lowerRollId"]) if step_row.get("lowerRollId") is not None else None
+
+        upper_changed = upper_id != prev_upper
+        lower_changed = lower_id != prev_lower
+        if upper_changed or lower_changed:
+            total_changes += int(upper_changed) + int(lower_changed)
+            if upper_changed and lower_changed:
+                synchronous_changes += 1
+            else:
+                independent_changes += 1
+
+        def emit_single_line_event(line_name: str, prev_id: Optional[int], next_id: Optional[int]) -> None:
+            """Tek hat için tek aktif rulo üstünden çıkar/tak/devam olayını üretir."""
+            if prev_id is not None and prev_id != next_id:
+                line_events.append({
+                    "timestampStep": step,
+                    "line": line_name,
+                    "action": "cikar",
+                    "rollId": prev_id,
+                    "orderIdFrom": prev_order,
+                    "orderIdTo": oid,
+                })
+            if next_id is not None and next_id != prev_id:
+                line_events.append({
+                    "timestampStep": step,
+                    "line": line_name,
+                    "action": "tak",
+                    "rollId": next_id,
+                    "orderIdFrom": prev_order,
+                    "orderIdTo": oid,
+                })
+            if next_id is not None and next_id == prev_id:
+                line_events.append({
+                    "timestampStep": step,
+                    "line": line_name,
+                    "action": "devam",
+                    "rollId": next_id,
+                    "orderIdFrom": prev_order,
+                    "orderIdTo": oid,
+                })
+
+        emit_single_line_event("ust", prev_upper, upper_id)
+        emit_single_line_event("alt", prev_lower, lower_id)
+
+        prev_upper = upper_id
+        prev_lower = lower_id
+        prev_order = oid
+
+    summary = {
+        "totalChanges": int(total_changes),
+        "synchronousChanges": int(synchronous_changes),
+        "independentChanges": int(independent_changes),
+    }
+    return line_events, summary
+
+
+def build_line_schedule(cutting_plan: List[Dict]) -> List[Dict]:
+    """
+    Kesim planından rulo bazlı tek hat (üst+alt) adım çizelgesi üretir.
+
+    Args:
+        cutting_plan: Çözümden gelen satırlar
+
+    Returns:
+        [{"step": int, "upperRollId": int|null, "lowerRollId": int|null, "cuts": [...]}]
+    """
+    by_order: Dict[int, List[Dict]] = defaultdict(list)
+    for row in cutting_plan:
+        by_order[int(row["orderId"])].append(row)
+
+    schedule: List[Dict] = []
+    step = 0
+    for oid in sorted(by_order.keys()):
+        order_rows = by_order[oid]
+        upper_rows, lower_rows = _partition_order_slices_for_surfaces(order_rows)
+        max_len = max(len(upper_rows), len(lower_rows), 1)
+        for idx in range(max_len):
+            step += 1
+            upper_row = upper_rows[idx] if idx < len(upper_rows) else None
+            lower_row = lower_rows[idx] if idx < len(lower_rows) else None
+            cuts = []
+            if upper_row is not None:
+                cuts.append({
+                    "orderId": oid,
+                    "rollId": int(upper_row["rollId"]),
+                    "tonnage": float(upper_row.get("tonnage") or 0.0),
+                    "m2": float(upper_row.get("m2") or 0.0),
+                    "upperTonnage": float(upper_row.get("upperTonnage") or 0.0),
+                    "lowerTonnage": float(upper_row.get("lowerTonnage") or 0.0),
+                })
+            if lower_row is not None:
+                cuts.append({
+                    "orderId": oid,
+                    "rollId": int(lower_row["rollId"]),
+                    "tonnage": float(lower_row.get("tonnage") or 0.0),
+                    "m2": float(lower_row.get("m2") or 0.0),
+                    "upperTonnage": float(lower_row.get("upperTonnage") or 0.0),
+                    "lowerTonnage": float(lower_row.get("lowerTonnage") or 0.0),
+                })
+            schedule.append({
+                "step": step,
+                "orderId": oid,
+                "upperRollId": int(upper_row["rollId"]) if upper_row is not None else None,
+                "lowerRollId": int(lower_row["rollId"]) if lower_row is not None else None,
+                "cuts": cuts,
+            })
+    return schedule
+
+
+def _rows_to_surface_queue(rows: List[Dict], is_upper: bool) -> deque:
+    """
+    Kesim satırlarından (tek yüzey listesi) kuyruk üretir: her eleman rollId, ton, m2.
+
+    Args:
+        rows: Üst veya alt yüzey dilim satırları
+        is_upper: True ise üst tonajı alınır
+
+    Returns:
+        collections.deque sözlükleri
+    """
+    q: deque = deque()
+    for r in rows:
+        row_ton = float(r.get("tonnage") or 0.0)
+        if is_upper:
+            t = float(r.get("upperTonnage") or 0.0)
+            if t < 1e-9 and row_ton > 1e-9:
+                t = row_ton
+        else:
+            t = float(r.get("lowerTonnage") or 0.0)
+            if t < 1e-9 and row_ton > 1e-9:
+                t = row_ton
+        if t < 1e-9:
+            continue
+        row_m2 = float(r.get("m2") or 0.0)
+        m2_alloc = row_m2 * (t / row_ton) if row_ton > 1e-9 else row_m2
+        q.append({
+            "rollId": int(r["rollId"]),
+            "ton": float(t),
+            "m2": float(m2_alloc),
+        })
+    return q
+
+
+def build_symmetric_steps_for_order(oid: int, order_rows: List[Dict]) -> List[Dict]:
+    """
+    Bir sipariş için üst/alt kuyrukları eş zamanlı tüketerek her adımda ust_ton == alt_ton olacak adımlar üretir.
+
+    Args:
+        oid: Sipariş kimliği
+        order_rows: Bu siparişe ait kesim satırları
+
+    Returns:
+        Operasyon sözlükleri (upperRollId, lowerRollId, cuts); boş ise simetrik üretilemedi
+    """
+    upper_rows, lower_rows = _partition_order_slices_for_surfaces(order_rows)
+    uq = _rows_to_surface_queue(upper_rows, True)
+    lq = _rows_to_surface_queue(lower_rows, False)
+    if not uq or not lq:
+        return []
+    sum_u = sum(float(x["ton"]) for x in uq)
+    sum_l = sum(float(x["ton"]) for x in lq)
+    if abs(sum_u - sum_l) > 0.05:
+        logger.warning(
+            "Siparis %s ust toplam %.4f ile alt toplam %.4f farkli; simetrik kuyruk riskli",
+            oid,
+            sum_u,
+            sum_l,
+        )
+    steps: List[Dict] = []
+    eps = 1e-6
+    while uq and lq:
+        u = uq[0]
+        l = lq[0]
+        step = min(float(u["ton"]), float(l["ton"]))
+        if step < eps:
+            if float(u["ton"]) < eps:
+                uq.popleft()
+            if float(l["ton"]) < eps:
+                lq.popleft()
+            continue
+        u_ton = float(u["ton"])
+        l_ton = float(l["ton"])
+        u_m2_step = float(u["m2"]) * (step / u_ton) if u_ton > eps else 0.0
+        l_m2_step = float(l["m2"]) * (step / l_ton) if l_ton > eps else 0.0
+        cuts = [
+            {
+                "orderId": oid,
+                "rollId": int(u["rollId"]),
+                "tonnage": round(step, 4),
+                "m2": round(u_m2_step, 4),
+                "upperTonnage": round(step, 4),
+                "lowerTonnage": 0.0,
+            },
+            {
+                "orderId": oid,
+                "rollId": int(l["rollId"]),
+                "tonnage": round(step, 4),
+                "m2": round(l_m2_step, 4),
+                "upperTonnage": 0.0,
+                "lowerTonnage": round(step, 4),
+            },
+        ]
+        steps.append({
+            "orderId": oid,
+            "upperRollId": int(u["rollId"]),
+            "lowerRollId": int(l["rollId"]),
+            "cuts": cuts,
+        })
+        u["ton"] = float(u["ton"]) - step
+        u["m2"] = float(u["m2"]) - u_m2_step
+        l["ton"] = float(l["ton"]) - step
+        l["m2"] = float(l["m2"]) - l_m2_step
+        if float(u["ton"]) < eps:
+            uq.popleft()
+        if float(l["ton"]) < eps:
+            lq.popleft()
+    if uq or lq:
+        logger.warning(
+            "Siparis %s sonunda kuyruk kaldi (ust=%d alt=%d); toplam eslesmesi bozuk olabilir",
+            oid,
+            len(uq),
+            len(lq),
+        )
+    return steps
+
+
+def build_symmetric_ops_by_order(cutting_plan: List[Dict]) -> Dict[int, List[Dict]]:
+    """
+    Kesim planından sipariş başına simetrik (ust==alt ton) atomik operasyon listesi üretir.
+
+    Args:
+        cutting_plan: LP kesim planı
+
+    Returns:
+        orderId -> operasyon listesi (sipariş içi sıra sabit). Herhangi bir siparişte simetrik
+        üretim başarısızsa boş sözlük döner (çağıran yedek yola geçer).
+    """
+    by_order: Dict[int, List[Dict]] = defaultdict(list)
+    for row in cutting_plan:
+        by_order[int(row["orderId"])].append(row)
+    out: Dict[int, List[Dict]] = {}
+    for oid in sorted(by_order.keys()):
+        steps = build_symmetric_steps_for_order(oid, by_order[oid])
+        if not steps:
+            return {}
+        out[oid] = steps
+    return out
+
+
+def _extract_legacy_index_pairing_ops(cutting_plan: List[Dict]) -> List[Dict]:
+    """
+    Eski indeks eşlemeli operasyon çıkarımı (simetrik üretim başarısız olursa yedek).
+
+    Args:
+        cutting_plan: Kesim planı
+
+    Returns:
+        Operasyon listesi
+    """
+    by_order: Dict[int, List[Dict]] = defaultdict(list)
+    for row in cutting_plan:
+        by_order[int(row["orderId"])].append(row)
+
+    ops: List[Dict] = []
+    for oid in sorted(by_order.keys()):
+        order_rows = by_order[oid]
+        upper_rows, lower_rows = _partition_order_slices_for_surfaces(order_rows)
+        max_len = max(len(upper_rows), len(lower_rows), 1)
+        for idx in range(max_len):
+            upper_row = upper_rows[idx] if idx < len(upper_rows) else None
+            lower_row = lower_rows[idx] if idx < len(lower_rows) else None
+            if upper_row is None and lower_row is None:
+                continue
+            cuts: List[Dict] = []
+            if upper_row is not None:
+                ut = float(upper_row.get("upperTonnage") or 0.0) or float(upper_row.get("tonnage") or 0.0)
+                um2 = float(upper_row.get("m2") or 0.0)
+                row_ton = float(upper_row.get("tonnage") or 1.0)
+                cuts.append({
+                    "orderId": oid,
+                    "rollId": int(upper_row["rollId"]),
+                    "tonnage": round(ut, 4),
+                    "m2": round(um2 * (ut / row_ton) if row_ton > 1e-9 else um2, 4),
+                    "upperTonnage": round(float(upper_row.get("upperTonnage") or 0.0), 4),
+                    "lowerTonnage": 0.0,
+                })
+            if lower_row is not None:
+                lt = float(lower_row.get("lowerTonnage") or 0.0) or float(lower_row.get("tonnage") or 0.0)
+                lm2 = float(lower_row.get("m2") or 0.0)
+                tot = float(lower_row.get("tonnage") or 0.0)
+                cuts.append({
+                    "orderId": oid,
+                    "rollId": int(lower_row["rollId"]),
+                    "tonnage": round(lt, 4),
+                    "m2": round(lm2 * (lt / tot) if tot > 1e-9 else lm2, 4),
+                    "upperTonnage": 0.0,
+                    "lowerTonnage": round(float(lower_row.get("lowerTonnage") or 0.0), 4),
+                })
+            ops.append({
+                "orderId": oid,
+                "upperRollId": int(upper_row["rollId"]) if upper_row is not None else None,
+                "lowerRollId": int(lower_row["rollId"]) if lower_row is not None else None,
+                "cuts": cuts,
+            })
+    return ops
+
+
+def extract_atomic_operations(cutting_plan: List[Dict]) -> List[Dict]:
+    """
+    Kesim planından atomik hat adımlarını üretir (simetrik kuyruk; başarısızsa eski eşleme).
+
+    Args:
+        cutting_plan: Çözüm kesim planı satırları
+
+    Returns:
+        step numarasız operasyon sözlükleri listesi (sipariş ID sırasıyla birleştirilmiş)
+    """
+    by_o = build_symmetric_ops_by_order(cutting_plan)
+    if not by_o:
+        return _extract_legacy_index_pairing_ops(cutting_plan)
+    return [op for oid in sorted(by_o.keys()) for op in by_o[oid]]
+
+
+def _operation_transition_cost(op_a: Dict, op_b: Dict, sync_level: str) -> float:
+    """
+    İki ardışık operasyon arası geçiş maliyetini hesaplar (rulo değişimi + sipariş cezası).
+
+    Args:
+        op_a: Önceki operasyon
+        op_b: Sonraki operasyon
+        sync_level: serbest | dengeli | siki
+
+    Returns:
+        Skaler maliyet (MILP amaç katsayısı)
+    """
+    ua = op_a.get("upperRollId")
+    la = op_a.get("lowerRollId")
+    ub = op_b.get("upperRollId")
+    lb = op_b.get("lowerRollId")
+    cu = 1.0 if ua != ub else 0.0
+    cl = 1.0 if la != lb else 0.0
+    base = cu + cl
+    if sync_level == "dengeli":
+        base += 0.35 * abs(cu - cl)
+    elif sync_level == "siki":
+        if cu != cl:
+            base += 2.5
+    order_penalty = 0.08 if int(op_a["orderId"]) != int(op_b["orderId"]) else 0.0
+    return base + order_penalty
+
+
+def _greedy_operation_order(ops: List[Dict], sync_level: str) -> List[int]:
+    """
+    Operasyon sırasını maliyeti azaltan açgözlü yöntemle üretir (MILP yedeği).
+
+    Args:
+        ops: Atomik operasyon listesi
+        sync_level: Senkron seviye etiketi
+
+    Returns:
+        ops indekslerinin sırası
+    """
+    n = len(ops)
+    if n <= 1:
+        return list(range(n))
+    remaining = set(range(n))
+    # Başlangıç: toplam çıkış maliyeti en düşük düğüm
+    best_start = min(remaining, key=lambda i: sum(_operation_transition_cost(ops[i], ops[j], sync_level) for j in remaining if j != i))
+    order_indices = [best_start]
+    remaining.remove(best_start)
+    while remaining:
+        last = order_indices[-1]
+        nxt = min(remaining, key=lambda j: _operation_transition_cost(ops[last], ops[j], sync_level))
+        order_indices.append(nxt)
+        remaining.remove(nxt)
+    return order_indices
+
+
+def _solve_operation_order_milp(
+    ops: List[Dict],
+    sync_level: str,
+    time_limit_seconds: int,
+) -> Optional[List[int]]:
+    """
+    ATSP benzeri sıralamayı konum değişkenleriyle MILP olarak çözer.
+
+    Args:
+        ops: Atomik operasyonlar
+        sync_level: Senkron seviye
+        time_limit_seconds: CBC zaman sınırı
+
+    Returns:
+        Optimal permütasyon indeksleri veya çözülemezse None
+    """
+    n = len(ops)
+    if n <= 1:
+        return list(range(n))
+    P = list(range(n))
+    K = list(range(n))
+    model = pulp.LpProblem("HatAdimiSirasi", pulp.LpMinimize)
+    z = pulp.LpVariable.dicts("z", (P, K), cat="Binary")
+    for k in K:
+        model += pulp.lpSum(z[p][k] for p in P) == 1, f"op_at_most_once_{k}"
+    for p in P:
+        model += pulp.lpSum(z[p][k] for k in K) == 1, f"pos_filled_{p}"
+
+    y_vars: Dict[Tuple[int, int, int], pulp.LpVariable] = {}
+    obj_terms: List = []
+    for p in range(n - 1):
+        for k1 in K:
+            for k2 in K:
+                if k1 == k2:
+                    continue
+                yk = pulp.LpVariable(f"y_{p}_{k1}_{k2}", cat="Binary")
+                y_vars[(p, k1, k2)] = yk
+                model += yk <= z[p][k1], f"yk_le_z1_{p}_{k1}_{k2}"
+                model += yk <= z[p + 1][k2], f"yk_le_z2_{p}_{k1}_{k2}"
+                model += yk >= z[p][k1] + z[p + 1][k2] - 1, f"yk_ge_lin_{p}_{k1}_{k2}"
+                c = _operation_transition_cost(ops[k1], ops[k2], sync_level)
+                obj_terms.append(yk * c)
+    model += pulp.lpSum(obj_terms), "Toplam_gecis"
+
+    import multiprocessing
+
+    cpu_count = multiprocessing.cpu_count()
+    model.solve(
+        pulp.PULP_CBC_CMD(
+            msg=0,
+            timeLimit=max(5, int(time_limit_seconds)),
+            gapRel=0.02,
+            threads=cpu_count,
+        )
+    )
+    st = pulp.LpStatus[model.status]
+    if st != "Optimal":
+        return None
+    perm: List[int] = [-1] * n
+    for p in P:
+        for k in K:
+            if pulp.value(z[p][k]) is not None and pulp.value(z[p][k]) > 0.5:
+                perm[p] = k
+                break
+    if len(perm) != n or set(perm) != set(range(n)):
+        return None
+    return perm
+
+
+def _greedy_path_from_cost_matrix(cost: List[List[float]]) -> List[int]:
+    """
+    Maliyet matrisinden açgözlü Hamilton yolu (sipariş sırası) üretir.
+
+    Args:
+        cost: cost[i][j] = i bloğundan sonra j bloğunun başına geçiş maliyeti
+
+    Returns:
+        0..n-1 indeks permütasyonu
+    """
+    n = len(cost)
+    if n <= 1:
+        return list(range(n))
+    remaining = set(range(n))
+    best_start = min(
+        remaining,
+        key=lambda i: sum(float(cost[i][j]) for j in remaining if j != i),
+    )
+    seq = [best_start]
+    remaining.remove(best_start)
+    while remaining:
+        last = seq[-1]
+        nxt = min(remaining, key=lambda j: float(cost[last][j]))
+        seq.append(nxt)
+        remaining.remove(nxt)
+    return seq
+
+
+def _solve_tsp_path_from_cost_matrix(
+    cost: List[List[float]],
+    time_limit_seconds: int,
+) -> Optional[List[int]]:
+    """
+    Maliyet matrisi üzerinden sipariş blok sırası için MILP (konum ataması) çözer.
+
+    Args:
+        cost: n x n geçiş maliyetleri (diyagonal kullanılmaz)
+        time_limit_seconds: CBC süre sınırı
+
+    Returns:
+        Optimal indeks dizisi veya çözülemezse None
+    """
+    n = len(cost)
+    if n <= 1:
+        return list(range(n))
+    P = list(range(n))
+    K = list(range(n))
+    model = pulp.LpProblem("SiparisBlokSirasi", pulp.LpMinimize)
+    z = pulp.LpVariable.dicts("zo", (P, K), cat="Binary")
+    for k in K:
+        model += pulp.lpSum(z[p][k] for p in P) == 1, f"zo_row_{k}"
+    for p in P:
+        model += pulp.lpSum(z[p][k] for k in K) == 1, f"zo_col_{p}"
+
+    obj_terms: List = []
+    for p in range(n - 1):
+        for k1 in K:
+            for k2 in K:
+                if k1 == k2:
+                    continue
+                yk = pulp.LpVariable(f"yo_{p}_{k1}_{k2}", cat="Binary")
+                model += yk <= z[p][k1], f"yo_le1_{p}_{k1}_{k2}"
+                model += yk <= z[p + 1][k2], f"yo_le2_{p}_{k1}_{k2}"
+                model += yk >= z[p][k1] + z[p + 1][k2] - 1, f"yo_ge_{p}_{k1}_{k2}"
+                obj_terms.append(yk * float(cost[k1][k2]))
+    model += pulp.lpSum(obj_terms), "zo_obj"
+
+    import multiprocessing
+
+    cpu_count = multiprocessing.cpu_count()
+    model.solve(
+        pulp.PULP_CBC_CMD(
+            msg=0,
+            timeLimit=max(5, int(time_limit_seconds)),
+            gapRel=0.02,
+            threads=cpu_count,
+        )
+    )
+    st = pulp.LpStatus[model.status]
+    if st != "Optimal":
+        return None
+    perm: List[int] = [-1] * n
+    for p in P:
+        for k in K:
+            if pulp.value(z[p][k]) is not None and pulp.value(z[p][k]) > 0.5:
+                perm[p] = k
+                break
+    if len(perm) != n or set(perm) != set(range(n)):
+        return None
+    return perm
+
+
+def enrich_line_schedule_with_actions(ordered_ops: List[Dict]) -> List[Dict]:
+    """
+    Sıralı operasyonlara adım numarası ve operatör dostu aksiyon alanlarını ekler.
+
+    Args:
+        ordered_ops: Sırası kesinleşmiş operasyon sözlükleri (upperRollId, lowerRollId, orderId, cuts)
+
+    Returns:
+        API'ye uygun lineSchedule satırları
+    """
+    last_step_index_by_order: Dict[int, int] = {}
+    for idx, _op in enumerate(ordered_ops):
+        last_step_index_by_order[int(_op["orderId"])] = idx
+
+    seen_orders: Set[int] = set()
+    prev_upper: Optional[int] = None
+    prev_lower: Optional[int] = None
+    prev_order: Optional[int] = None
+    out: List[Dict] = []
+
+    def line_action(prev_id: Optional[int], new_id: Optional[int]) -> str:
+        """Tek hat için kısa aksiyon kodu döner."""
+        if prev_id == new_id:
+            return "devam"
+        if new_id is not None and (prev_id is None or prev_id != new_id):
+            return "takildi"
+        if prev_id is not None and new_id is None:
+            return "cikarildi"
+        return "devam"
+
+    for step_idx, op in enumerate(ordered_ops, start=1):
+        oid = int(op["orderId"])
+        u = op.get("upperRollId")
+        l = op.get("lowerRollId")
+        ui = int(u) if u is not None else None
+        li = int(l) if l is not None else None
+
+        ua = line_action(prev_upper, ui)
+        la = line_action(prev_lower, li)
+
+        is_last_for_order = last_step_index_by_order.get(oid, -1) == step_idx - 1
+        if is_last_for_order and prev_order is not None and oid == prev_order:
+            oa = "tamamlandi"
+        elif prev_order is None:
+            oa = "basladi"
+        elif oid == prev_order:
+            oa = "devam"
+        elif oid in seen_orders:
+            oa = "geri_donus"
+        else:
+            oa = "degisti"
+
+        parts: List[str] = []
+        if prev_order is None:
+            parts.append("Üretim başladı")
+        if ua != "devam" or la != "devam":
+            if ua == "takildi" and la == "takildi":
+                parts.append("Üst + alt rulo takıldı")
+            elif ua == "takildi":
+                pu = prev_upper
+                parts.append(f"Üst: R{ui} takıldı" + (f" (R{pu} çıkarıldı)" if pu is not None and pu != ui else ""))
+            elif la == "takildi":
+                pl = prev_lower
+                parts.append(f"Alt: R{li} takıldı" + (f" (R{pl} çıkarıldı)" if pl is not None and pl != li else ""))
+            elif ua == "cikarildi":
+                parts.append(f"Üst rulo çıkarıldı (R{prev_upper})")
+            elif la == "cikarildi":
+                parts.append(f"Alt rulo çıkarıldı (R{prev_lower})")
+            elif ua == "devam" and la == "takildi":
+                pl = prev_lower
+                parts.append(f"Alt: R{li} takıldı" + (f" (R{pl} çıkarıldı)" if pl is not None and pl != li else ""))
+            elif la == "devam" and ua == "takildi":
+                pu = prev_upper
+                parts.append(f"Üst: R{ui} takıldı" + (f" (R{pu} çıkarıldı)" if pu is not None and pu != ui else ""))
+        if prev_order is not None and oid != prev_order:
+            if oa == "geri_donus":
+                parts.append(f"Sipariş #{oid}'e geri dönüş")
+            else:
+                parts.append(f"Sipariş değişimi → #{oid}")
+
+        if is_last_for_order:
+            parts.append(f"Sipariş #{oid} bu fazda tamamlandı")
+
+        summary = " · ".join([p for p in parts if p]) or "Devam"
+        if summary == "Devam" and prev_order is not None and oid == prev_order and ua == "devam" and la == "devam":
+            summary = "Aynı rulolarla üretim devam"
+
+        row: Dict = {
+            "step": step_idx,
+            "orderId": oid,
+            "upperRollId": ui,
+            "lowerRollId": li,
+            "upperAction": ua,
+            "lowerAction": la,
+            "orderAction": oa,
+            "actionSummary": summary,
+            "prevUpperRollId": prev_upper,
+            "prevLowerRollId": prev_lower,
+            "cuts": op.get("cuts") or [],
+        }
+        out.append(row)
+        seen_orders.add(oid)
+        prev_upper = ui
+        prev_lower = li
+        prev_order = oid
+    return out
+
+
+def schedule_production_steps(
+    cutting_plan: List[Dict],
+    sync_level: str = "dengeli",
+    time_limit_seconds: int = 45,
+) -> List[Dict]:
+    """
+    LP kesim planından hat adım çizelgesi üretir.
+
+    Sipariş içi: üst/alt ton eşit simetrik kuyruk. Siparişler arası: MILP veya sezgisel blok sırası.
+
+    Args:
+        cutting_plan: Çözüm kesim planı
+        sync_level: Hat senkron seviyesi (geçiş maliyeti ağırlığı)
+        time_limit_seconds: MILP çözücü zaman sınırı
+
+    Returns:
+        lineSchedule API listesi (zengin aksiyon alanları dahil)
+    """
+    by_o = build_symmetric_ops_by_order(cutting_plan)
+    if not by_o:
+        ops = _extract_legacy_index_pairing_ops(cutting_plan)
+        if not ops:
+            return []
+        n = len(ops)
+        milp_threshold = 22
+        if n <= milp_threshold:
+            solved = _solve_operation_order_milp(ops, str(sync_level), time_limit_seconds)
+            perm = solved if solved is not None else _greedy_operation_order(ops, str(sync_level))
+        else:
+            perm = _greedy_operation_order(ops, str(sync_level))
+        ordered = [ops[i] for i in perm]
+        return enrich_line_schedule_with_actions(ordered)
+
+    oids = sorted(by_o.keys())
+    if len(oids) == 1:
+        return enrich_line_schedule_with_actions(by_o[oids[0]])
+
+    k = len(oids)
+    cost_mat: List[List[float]] = [[0.0] * k for _ in range(k)]
+    for i, oi in enumerate(oids):
+        for j, oj in enumerate(oids):
+            if i == j:
+                cost_mat[i][j] = 0.0
+            else:
+                last_op = by_o[oi][-1]
+                first_op = by_o[oj][0]
+                cost_mat[i][j] = _operation_transition_cost(last_op, first_op, str(sync_level))
+
+    order_milp_limit = 14
+    if k <= order_milp_limit:
+        idx_perm = _solve_tsp_path_from_cost_matrix(cost_mat, time_limit_seconds)
+        if idx_perm is None:
+            idx_perm = _greedy_path_from_cost_matrix(cost_mat)
+    else:
+        idx_perm = _greedy_path_from_cost_matrix(cost_mat)
+
+    flat: List[Dict] = []
+    for idx in idx_perm:
+        flat.extend(by_o[oids[idx]])
+    return enrich_line_schedule_with_actions(flat)
+
+
 def solve_optimization(
     thickness: float,
     density: float,
@@ -246,6 +1046,9 @@ def solve_optimization(
     require_dual_roll_allocation: bool = False,
     max_interleaving_orders: int = 2,
     interleaving_penalty_cost: float = 0.0,
+    enforce_surface_sync: bool = False,
+    sync_level: str = "dengeli",
+    sync_penalty_weight: float = 0.0,
 ) -> Tuple[str, Optional[Dict]]:
     """
     Optimizasyon modelini çöz. Panel uzunluğu ile kesim: uzunluk ve katları (örn. 3m → 3*33+1 fire).
@@ -255,6 +1058,9 @@ def solve_optimization(
     her (i,j) için w_u[i,j]+w_l[i,j] <= 1; dolayısıyla x_u[i,j] ve x_l[i,j]’den en fazla biri pozitif olabilir.
     require_dual_roll_allocation geri uyumluluk için yok sayılır.
     Siparişe dönüş sırası için araya giren sipariş üst sınırını aşan kesim sıralarına soft ceza eklenebilir.
+    enforce_surface_sync=True ise çift yüzeyde her sipariş için üstte kullanılan rulo adedi ile altta kullanılan
+    rulo adedi eşitlenir (sert kısıt).
+    sync_level='dengeli' ise üst/alt bağımsız değişim farklarına ceza eklenebilir.
     
     Returns:
         (Status, Results dictionary veya None)
@@ -290,6 +1096,7 @@ def solve_optimization(
     if dual_surface:
         x_u = pulp.LpVariable.dicts("x_u", [(i, j) for i in I for j in J], lowBound=0, cat="Continuous")
         x_l = pulp.LpVariable.dicts("x_l", [(i, j) for i in I for j in J], lowBound=0, cat="Continuous")
+        sync_diff = pulp.LpVariable.dicts("sync_diff", J, lowBound=0, cat="Continuous")
     else:
         x = pulp.LpVariable.dicts("x", [(i, j) for i in I for j in J], lowBound=0, cat="Continuous")
 
@@ -306,9 +1113,16 @@ def solve_optimization(
         w = pulp.LpVariable.dicts("w", [(i, j) for i in I for j in J], cat='Binary')
     
     # Amaç fonksiyonu
-    model += (pulp.lpSum([F[i] * fire_cost for i in I]) +
-              pulp.lpSum([R[i] * stock_cost for i in I]) +
-              pulp.lpSum([y[i] * setup_cost for i in I]), "Toplam_Maliyet")
+    sync_penalty_term = 0
+    if dual_surface and sync_level == "dengeli" and sync_penalty_weight > 0:
+        sync_penalty_term = pulp.lpSum([sync_diff[j] * sync_penalty_weight for j in J])
+    model += (
+        pulp.lpSum([F[i] * fire_cost for i in I]) +
+        pulp.lpSum([R[i] * stock_cost for i in I]) +
+        pulp.lpSum([y[i] * setup_cost for i in I]) +
+        sync_penalty_term,
+        "Toplam_Maliyet",
+    )
     
     # Talep kısıtı (çift yüzey: her yüzey tam D[j]/2)
     for j in J:
@@ -390,6 +1204,21 @@ def solve_optimization(
             )
         else:
             model += pulp.lpSum([w[(i, j)] for i in I]) <= max_rolls_per_order, f"Max_Rulo_Per_Siparis_{j}"
+
+    # Eşzamanlı mod: üst/alt rulo değişimlerinin aynı fazda olmasını desteklemek için
+    # her siparişte üst ve alt yüzeyde kullanılan rulo adedini eşitler (sert kısıt).
+    if dual_surface and enforce_surface_sync:
+        for j in J:
+            model += (
+                pulp.lpSum([w_u[(i, j)] for i in I]) == pulp.lpSum([w_l[(i, j)] for i in I]),
+                f"SurfaceSync_RollCount_{j}",
+            )
+    elif dual_surface and sync_level == "dengeli":
+        for j in J:
+            upper_count = pulp.lpSum([w_u[(i, j)] for i in I])
+            lower_count = pulp.lpSum([w_l[(i, j)] for i in I])
+            model += sync_diff[j] >= upper_count - lower_count, f"SyncDiff_Pos_{j}"
+            model += sync_diff[j] >= lower_count - upper_count, f"SyncDiff_Neg_{j}"
 
     # Çift yüzey: sipariş başına en az iki fiziksel rulo (üst ve alt için farklı rulo–sipariş atamaları)
     if float(surface_factor) >= 2.0 - 1e-12 and len(I) >= 2:
@@ -547,6 +1376,12 @@ def solve_optimization(
         "sequencePenalty": round(sequence_penalty, 4),
         "interleavingViolationCount": len(sequence_violations),
     }
+    sync_metrics = calculate_roll_change_and_sync_metrics(cutting_plan)
+    summary["rollChangeCount"] = sync_metrics["rollChangeCount"]
+    summary["surfaceSyncViolations"] = sync_metrics["surfaceSyncViolations"]
+    line_schedule = schedule_production_steps(cutting_plan, str(sync_level), time_limit_seconds)
+    line_events, line_transitions_summary = build_line_events(line_schedule)
+    line_transitions_summary["stepCount"] = len(line_schedule)
 
     lp_objective = round(pulp.value(model.objective), 2)
     results = {
@@ -558,6 +1393,12 @@ def solve_optimization(
         "sequencePenalty": round(sequence_penalty, 4),
         "sequenceViolations": sequence_violations,
         "rollOrderSequences": roll_order_sequences_json,
+        "rollChangeCount": sync_metrics["rollChangeCount"],
+        "surfaceSyncViolations": sync_metrics["surfaceSyncViolations"],
+        "lineEvents": line_events,
+        "lineSchedule": line_schedule,
+        "lineTransitionsSummary": line_transitions_summary,
+        "syncLevel": sync_level,
         "model_vars": (
             {
                 "x_u": x_u,
