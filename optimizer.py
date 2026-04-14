@@ -463,18 +463,93 @@ def _rows_to_surface_queue(rows: List[Dict], is_upper: bool) -> deque:
     return q
 
 
-def build_symmetric_steps_for_order(oid: int, order_rows: List[Dict]) -> List[Dict]:
+def _segment_ton_for_upper_row(r: Dict) -> float:
+    """
+    Üst yüzey dilimi için segment tonajını döndürür (üst alan yoksa satır tonajına düşer).
+
+    Args:
+        r: Kesim planı satırı
+
+    Returns:
+        Ton cinsinden segment büyüklüğü
+    """
+    row_ton = float(r.get("tonnage") or 0.0)
+    t = float(r.get("upperTonnage") or 0.0)
+    if t < 1e-9 and row_ton > 1e-9:
+        t = row_ton
+    return float(t)
+
+
+def _segment_ton_for_lower_row(r: Dict) -> float:
+    """
+    Alt yüzey dilimi için segment tonajını döndürür (alt alan yoksa satır tonajına düşer).
+
+    Args:
+        r: Kesim planı satırı
+
+    Returns:
+        Ton cinsinden segment büyüklüğü
+    """
+    row_ton = float(r.get("tonnage") or 0.0)
+    t = float(r.get("lowerTonnage") or 0.0)
+    if t < 1e-9 and row_ton > 1e-9:
+        t = row_ton
+    return float(t)
+
+
+def _try_siki_ton_aligned_rows(
+    upper_rows: List[Dict],
+    lower_rows: List[Dict],
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Üst ve alt dilim ton çoklu kümeleri eşleşiyorsa satırları azalan tona göre hizalı sıraya çevirir.
+
+    Aynı rank'taki dilimler eş ton olduğunda simetrik kuyruk tam dilim adımlarında biter;
+    böylece üst ve alt rulo değişimleri aynı adımda hizalanır.
+
+    Args:
+        upper_rows: Üst yüzey satırları
+        lower_rows: Alt yüzey satırları
+
+    Returns:
+        (üst_satırlar, alt_satırlar) — eşleşme yoksa orijinal listeler
+    """
+    if not upper_rows or not lower_rows or len(upper_rows) != len(lower_rows):
+        return upper_rows, lower_rows
+    u_tons = [_segment_ton_for_upper_row(r) for r in upper_rows]
+    l_tons = [_segment_ton_for_lower_row(r) for r in lower_rows]
+    u_sorted = sorted(u_tons, reverse=True)
+    l_sorted = sorted(l_tons, reverse=True)
+    tol = 0.05
+    for i in range(len(u_sorted)):
+        if abs(u_sorted[i] - l_sorted[i]) > tol:
+            return upper_rows, lower_rows
+    u_order = sorted(range(len(upper_rows)), key=lambda idx: -u_tons[idx])
+    l_order = sorted(range(len(lower_rows)), key=lambda idx: -l_tons[idx])
+    u_aligned = [upper_rows[i] for i in u_order]
+    l_aligned = [lower_rows[i] for i in l_order]
+    return u_aligned, l_aligned
+
+
+def build_symmetric_steps_for_order(
+    oid: int,
+    order_rows: List[Dict],
+    sync_level: str = "dengeli",
+) -> List[Dict]:
     """
     Bir sipariş için üst/alt kuyrukları eş zamanlı tüketerek her adımda ust_ton == alt_ton olacak adımlar üretir.
 
     Args:
         oid: Sipariş kimliği
         order_rows: Bu siparişe ait kesim satırları
+        sync_level: 'siki' iken ton çoklu kümeleri uyuyorsa dilim sırası hizalanır
 
     Returns:
         Operasyon sözlükleri (upperRollId, lowerRollId, cuts); boş ise simetrik üretilemedi
     """
     upper_rows, lower_rows = _partition_order_slices_for_surfaces(order_rows)
+    if str(sync_level) == "siki":
+        upper_rows, lower_rows = _try_siki_ton_aligned_rows(upper_rows, lower_rows)
     uq = _rows_to_surface_queue(upper_rows, True)
     lq = _rows_to_surface_queue(lower_rows, False)
     if not uq or not lq:
@@ -546,12 +621,16 @@ def build_symmetric_steps_for_order(oid: int, order_rows: List[Dict]) -> List[Di
     return steps
 
 
-def build_symmetric_ops_by_order(cutting_plan: List[Dict]) -> Dict[int, List[Dict]]:
+def build_symmetric_ops_by_order(
+    cutting_plan: List[Dict],
+    sync_level: str = "dengeli",
+) -> Dict[int, List[Dict]]:
     """
     Kesim planından sipariş başına simetrik (ust==alt ton) atomik operasyon listesi üretir.
 
     Args:
         cutting_plan: LP kesim planı
+        sync_level: Hat senkron seviyesi (sıkı modda dilim hizalama denemesi)
 
     Returns:
         orderId -> operasyon listesi (sipariş içi sıra sabit). Herhangi bir siparişte simetrik
@@ -562,7 +641,7 @@ def build_symmetric_ops_by_order(cutting_plan: List[Dict]) -> Dict[int, List[Dic
         by_order[int(row["orderId"])].append(row)
     out: Dict[int, List[Dict]] = {}
     for oid in sorted(by_order.keys()):
-        steps = build_symmetric_steps_for_order(oid, by_order[oid])
+        steps = build_symmetric_steps_for_order(oid, by_order[oid], str(sync_level))
         if not steps:
             return {}
         out[oid] = steps
@@ -627,17 +706,21 @@ def _extract_legacy_index_pairing_ops(cutting_plan: List[Dict]) -> List[Dict]:
     return ops
 
 
-def extract_atomic_operations(cutting_plan: List[Dict]) -> List[Dict]:
+def extract_atomic_operations(
+    cutting_plan: List[Dict],
+    sync_level: str = "dengeli",
+) -> List[Dict]:
     """
     Kesim planından atomik hat adımlarını üretir (simetrik kuyruk; başarısızsa eski eşleme).
 
     Args:
         cutting_plan: Çözüm kesim planı satırları
+        sync_level: Simetrik dilim üretiminde kullanılacak senkron seviyesi
 
     Returns:
         step numarasız operasyon sözlükleri listesi (sipariş ID sırasıyla birleştirilmiş)
     """
-    by_o = build_symmetric_ops_by_order(cutting_plan)
+    by_o = build_symmetric_ops_by_order(cutting_plan, str(sync_level))
     if not by_o:
         return _extract_legacy_index_pairing_ops(cutting_plan)
     return [op for oid in sorted(by_o.keys()) for op in by_o[oid]]
@@ -765,6 +848,262 @@ def _solve_operation_order_milp(
     if len(perm) != n or set(perm) != set(range(n)):
         return None
     return perm
+
+
+def _strip_internal_op_fields(op: Dict) -> Dict:
+    """
+    Zamanlama yardımcı alanlarını (alt çizgi ile başlayan anahtarlar) kaldırır.
+
+    Args:
+        op: Ham operasyon sözlüğü
+
+    Returns:
+        API ve enrich için uygun kopya
+    """
+    return {k: v for k, v in op.items() if not str(k).startswith("_")}
+
+
+def _flatten_ops_with_precedence(
+    by_o: Dict[int, List[Dict]],
+) -> Tuple[List[Dict], List[Tuple[int, int]]]:
+    """
+    Sipariş zincirlerini tek düz listeye çevirir ve sipariş içi öncelik kenarlarını üretir.
+
+    Args:
+        by_o: orderId -> simetrik operasyon zinciri (iç sıra korunur)
+
+    Returns:
+        (düz_operasyonlar, (önceki_indeks, sonraki_indeks) öncelik listesi)
+    """
+    flat: List[Dict] = []
+    prec: List[Tuple[int, int]] = []
+    for oid in sorted(by_o.keys()):
+        chain = by_o[oid]
+        prev_idx: Optional[int] = None
+        for sub_i, op in enumerate(chain):
+            op2 = dict(op)
+            idx = len(flat)
+            op2["_flat_idx"] = idx
+            op2["_sub_idx"] = sub_i
+            op2["_chain_oid"] = oid
+            flat.append(op2)
+            if prev_idx is not None:
+                prec.append((prev_idx, idx))
+            prev_idx = idx
+    return flat, prec
+
+
+def _total_transition_cost(seq: List[int], ops: List[Dict], sync_level: str) -> float:
+    """
+    Verilen indeks dizisi için ardışık operasyon geçiş maliyetlerinin toplamını hesaplar.
+
+    Args:
+        seq: ops indekslerinin üretim sırası
+        ops: Operasyon listesi
+        sync_level: serbest | dengeli | siki
+
+    Returns:
+        Toplam geçiş maliyeti
+    """
+    if len(seq) <= 1:
+        return 0.0
+    total = 0.0
+    for i in range(len(seq) - 1):
+        total += _operation_transition_cost(ops[seq[i]], ops[seq[i + 1]], sync_level)
+    return total
+
+
+def _valid_precedence_order(seq: List[int], prec_edges: List[Tuple[int, int]]) -> bool:
+    """
+    Dizinin tüm öncelik kenarlarını (a, b) için a'dan önce b gelmesini sağlayıp sağlamadığını kontrol eder.
+
+    Args:
+        seq: Permütasyon (ops indeksleri)
+        prec_edges: Öncelik kenarları
+
+    Returns:
+        Geçerliyse True
+    """
+    pos = {seq[i]: i for i in range(len(seq))}
+    for a, b in prec_edges:
+        if pos.get(a, -1) >= pos.get(b, -2):
+            return False
+    return True
+
+
+def _greedy_precedence_operation_order(
+    ops: List[Dict],
+    prec_edges: List[Tuple[int, int]],
+    sync_level: str,
+) -> List[int]:
+    """
+    Öncelik kısıtlı DAG üzerinde açgözlü sıra üretir (MILP yedeği ve büyük n için).
+
+    Args:
+        ops: Düz operasyon listesi
+        prec_edges: Sipariş içi zincir öncelikleri
+        sync_level: Geçiş maliyeti ağırlığı
+
+    Returns:
+        ops indekslerinin üretim sırası
+    """
+    n = len(ops)
+    if n <= 1:
+        return list(range(n))
+    succ: Dict[int, List[int]] = defaultdict(list)
+    pred_count = [0] * n
+    for a, b in prec_edges:
+        succ[a].append(b)
+        pred_count[b] += 1
+    remaining = {i for i in range(n) if pred_count[i] == 0}
+    if not remaining:
+        return _greedy_operation_order(ops, sync_level)
+    order_indices: List[int] = []
+    first = min(
+        remaining,
+        key=lambda i: sum(
+            _operation_transition_cost(ops[i], ops[j], sync_level) for j in remaining if j != i
+        ),
+    )
+    order_indices.append(first)
+    remaining.remove(first)
+    for b in succ[first]:
+        pred_count[b] -= 1
+        if pred_count[b] == 0:
+            remaining.add(b)
+    while remaining:
+        last = order_indices[-1]
+        nxt = min(
+            remaining,
+            key=lambda j: _operation_transition_cost(ops[last], ops[j], sync_level),
+        )
+        order_indices.append(nxt)
+        remaining.remove(nxt)
+        for b in succ[nxt]:
+            pred_count[b] -= 1
+            if pred_count[b] == 0:
+                remaining.add(b)
+    if len(order_indices) < n:
+        for i in range(n):
+            if i not in order_indices:
+                order_indices.append(i)
+    return order_indices
+
+
+def _solve_precedence_constrained_order_milp(
+    ops: List[Dict],
+    prec_edges: List[Tuple[int, int]],
+    sync_level: str,
+    time_limit_seconds: int,
+) -> Optional[List[int]]:
+    """
+    Tüm operasyonların permütasyonunu konum değişkenleriyle çözer; sipariş içi öncelikleri doğrusal kısıtlar.
+
+    Args:
+        ops: Düz operasyon listesi
+        prec_edges: pos[b] >= pos[a] + 1 kısıtları
+        sync_level: Geçiş maliyeti
+        time_limit_seconds: CBC süre sınırı
+
+    Returns:
+        Optimal indeks dizisi veya çözülemezse None
+    """
+    n = len(ops)
+    if n <= 1:
+        return list(range(n))
+    P = list(range(n))
+    K = list(range(n))
+    model = pulp.LpProblem("HatAdimiOncelikli", pulp.LpMinimize)
+    z = pulp.LpVariable.dicts("zp", (P, K), cat="Binary")
+    for k in K:
+        model += pulp.lpSum(z[p][k] for p in P) == 1, f"zp_row_{k}"
+    for p in P:
+        model += pulp.lpSum(z[p][k] for k in K) == 1, f"zp_col_{p}"
+
+    pos_expr = {k: pulp.lpSum(p * z[p][k] for p in P) for k in K}
+    for a, b in prec_edges:
+        model += pos_expr[b] >= pos_expr[a] + 1, f"zp_prec_{a}_{b}"
+
+    y_vars: Dict[Tuple[int, int, int], pulp.LpVariable] = {}
+    obj_terms: List = []
+    for p in range(n - 1):
+        for k1 in K:
+            for k2 in K:
+                if k1 == k2:
+                    continue
+                yk = pulp.LpVariable(f"yp_{p}_{k1}_{k2}", cat="Binary")
+                y_vars[(p, k1, k2)] = yk
+                model += yk <= z[p][k1], f"yp_le1_{p}_{k1}_{k2}"
+                model += yk <= z[p + 1][k2], f"yp_le2_{p}_{k1}_{k2}"
+                model += yk >= z[p][k1] + z[p + 1][k2] - 1, f"yp_ge_{p}_{k1}_{k2}"
+                c = _operation_transition_cost(ops[k1], ops[k2], sync_level)
+                obj_terms.append(yk * c)
+    model += pulp.lpSum(obj_terms), "zp_obj"
+
+    import multiprocessing
+
+    cpu_count = multiprocessing.cpu_count()
+    model.solve(
+        pulp.PULP_CBC_CMD(
+            msg=0,
+            timeLimit=max(5, int(time_limit_seconds)),
+            gapRel=0.02,
+            threads=cpu_count,
+        )
+    )
+    st = pulp.LpStatus[model.status]
+    if st != "Optimal":
+        return None
+    perm: List[int] = [-1] * n
+    for p in P:
+        for k in K:
+            if pulp.value(z[p][k]) is not None and pulp.value(z[p][k]) > 0.5:
+                perm[p] = k
+                break
+    if len(perm) != n or set(perm) != set(range(n)):
+        return None
+    return perm
+
+
+def _improve_precedence_sequence_by_adjacent_swaps(
+    seq: List[int],
+    ops: List[Dict],
+    prec_edges: List[Tuple[int, int]],
+    sync_level: str,
+    max_passes: int = 80,
+) -> List[int]:
+    """
+    Önceliği bozmayan bitişik yer değiştirmelerle geçiş maliyetini iyileştirir (2-opt benzeri).
+
+    Args:
+        seq: Başlangıç permütasyonu (ops indeksleri)
+        ops: Operasyon listesi
+        prec_edges: Öncelik kenarları
+        sync_level: Geçiş maliyeti
+        max_passes: Dış döngü üst sınırı
+
+    Returns:
+        İyileştirilmiş permütasyon
+    """
+    best = seq[:]
+    best_cost = _total_transition_cost(best, ops, sync_level)
+    passes = 0
+    improved = True
+    while improved and passes < max_passes:
+        improved = False
+        passes += 1
+        for i in range(len(best) - 1):
+            cand = best[:]
+            cand[i], cand[i + 1] = cand[i + 1], cand[i]
+            if not _valid_precedence_order(cand, prec_edges):
+                continue
+            c = _total_transition_cost(cand, ops, sync_level)
+            if c + 1e-9 < best_cost:
+                best = cand
+                best_cost = c
+                improved = True
+                break
+    return best
 
 
 def _greedy_path_from_cost_matrix(cost: List[List[float]]) -> List[int]:
@@ -975,7 +1314,8 @@ def schedule_production_steps(
     """
     LP kesim planından hat adım çizelgesi üretir.
 
-    Sipariş içi: üst/alt ton eşit simetrik kuyruk. Siparişler arası: MILP veya sezgisel blok sırası.
+    Sipariş içi: üst/alt ton eşit simetrik kuyruk. Çoklu siparişte tüm atomik adımlar tek listede
+    sıralanır; sipariş içi zincir sırası öncelik kısıtıyla korunur (A-B-A ara girme mümkün).
 
     Args:
         cutting_plan: Çözüm kesim planı
@@ -985,7 +1325,8 @@ def schedule_production_steps(
     Returns:
         lineSchedule API listesi (zengin aksiyon alanları dahil)
     """
-    by_o = build_symmetric_ops_by_order(cutting_plan)
+    sl = str(sync_level)
+    by_o = build_symmetric_ops_by_order(cutting_plan, sl)
     if not by_o:
         ops = _extract_legacy_index_pairing_ops(cutting_plan)
         if not ops:
@@ -993,40 +1334,36 @@ def schedule_production_steps(
         n = len(ops)
         milp_threshold = 22
         if n <= milp_threshold:
-            solved = _solve_operation_order_milp(ops, str(sync_level), time_limit_seconds)
-            perm = solved if solved is not None else _greedy_operation_order(ops, str(sync_level))
+            solved = _solve_operation_order_milp(ops, sl, time_limit_seconds)
+            perm = solved if solved is not None else _greedy_operation_order(ops, sl)
         else:
-            perm = _greedy_operation_order(ops, str(sync_level))
+            perm = _greedy_operation_order(ops, sl)
+        perm = _improve_precedence_sequence_by_adjacent_swaps(perm, ops, [], sl)
         ordered = [ops[i] for i in perm]
         return enrich_line_schedule_with_actions(ordered)
 
     oids = sorted(by_o.keys())
     if len(oids) == 1:
-        return enrich_line_schedule_with_actions(by_o[oids[0]])
+        chain = [_strip_internal_op_fields(op) for op in by_o[oids[0]]]
+        return enrich_line_schedule_with_actions(chain)
 
-    k = len(oids)
-    cost_mat: List[List[float]] = [[0.0] * k for _ in range(k)]
-    for i, oi in enumerate(oids):
-        for j, oj in enumerate(oids):
-            if i == j:
-                cost_mat[i][j] = 0.0
-            else:
-                last_op = by_o[oi][-1]
-                first_op = by_o[oj][0]
-                cost_mat[i][j] = _operation_transition_cost(last_op, first_op, str(sync_level))
-
-    order_milp_limit = 14
-    if k <= order_milp_limit:
-        idx_perm = _solve_tsp_path_from_cost_matrix(cost_mat, time_limit_seconds)
-        if idx_perm is None:
-            idx_perm = _greedy_path_from_cost_matrix(cost_mat)
+    flat_ops, prec_edges = _flatten_ops_with_precedence(by_o)
+    n = len(flat_ops)
+    milp_threshold = 22
+    if n <= milp_threshold:
+        solved = _solve_precedence_constrained_order_milp(
+            flat_ops, prec_edges, sl, time_limit_seconds
+        )
+        perm = (
+            solved
+            if solved is not None
+            else _greedy_precedence_operation_order(flat_ops, prec_edges, sl)
+        )
     else:
-        idx_perm = _greedy_path_from_cost_matrix(cost_mat)
-
-    flat: List[Dict] = []
-    for idx in idx_perm:
-        flat.extend(by_o[oids[idx]])
-    return enrich_line_schedule_with_actions(flat)
+        perm = _greedy_precedence_operation_order(flat_ops, prec_edges, sl)
+    perm = _improve_precedence_sequence_by_adjacent_swaps(perm, flat_ops, prec_edges, sl)
+    ordered = [_strip_internal_op_fields(flat_ops[i]) for i in perm]
+    return enrich_line_schedule_with_actions(ordered)
 
 
 def solve_optimization(
