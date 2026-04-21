@@ -58,8 +58,44 @@ class TestOptimizationConsistency(unittest.TestCase):
         self.assertIn("summary", results)
         self.assertIn("cuttingPlan", results)
 
+    def test_roll_status_tonnage_fields_on_kilogram_grid(self):
+        """Rulo ton alanları 1 kg (0,001 t) ızgarasında olmalı (raporlama kg defteri)."""
+        orders = _make_orders([80, 60], panel_width=1.0)
+        rolls = [20, 15, 10]
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=[1.0, 1.0],
+            rolls=rolls,
+            max_orders_per_roll=5,
+            max_rolls_per_order=3,
+            fire_cost=450,
+            setup_cost=120,
+            stock_cost=2.5,
+            time_limit_seconds=30,
+        )
+        self.assertEqual(status, "Optimal")
+        for item in results["rollStatus"]:
+            for key in (
+                "totalTonnage",
+                "used",
+                "fire",
+                "stock",
+                "unusedRollTonnage",
+                "remaining",
+            ):
+                v = float(item.get(key, 0) or 0)
+                kg = round(v * 1000.0)
+                self.assertAlmostEqual(
+                    v,
+                    kg / 1000.0,
+                    places=9,
+                    msg=f"Rulo {item['rollId']} {key}={v} 1 kg ızgarasında değil",
+                )
+
     def test_roll_status_used_plus_stock_plus_fire_equals_total_tonnage(self):
-        """Her ruloda: used + stock + fire = totalTonnage (sunum tutarlılığı)."""
+        """Her ruloda: used + stock + fire + unusedRollTonnage = totalTonnage (sunum tutarlılığı)."""
         orders = _make_orders([80, 60], panel_width=1.0)
         rolls = [20, 15, 10]
         status, results = solve_optimization(
@@ -82,12 +118,12 @@ class TestOptimizationConsistency(unittest.TestCase):
             used = float(item["used"])
             stock = float(item["stock"])
             fire = float(item["fire"])
-            toplam_kalan = stock + fire
+            unused = float(item.get("unusedRollTonnage", 0) or 0)
             self.assertAlmostEqual(
-                used + toplam_kalan,
+                used + stock + fire + unused,
                 total,
                 places=4,
-                msg=f"Rulo {item['rollId']}: used+stock+fire={used}+{stock}+{fire}={used + toplam_kalan} != totalTonnage={total}",
+                msg=f"Rulo {item['rollId']}: used+stock+fire+eldeki={used}+{stock}+{fire}+{unused} != totalTonnage={total}",
             )
 
     def test_summary_totals_match_roll_status(self):
@@ -123,6 +159,79 @@ class TestOptimizationConsistency(unittest.TestCase):
             sum_stock,
             places=4,
             msg="summary.totalStock roll_status stock toplamına eşit olmalı",
+        )
+        sum_unused = sum(float(r.get("unusedRollTonnage", 0) or 0) for r in roll_status)
+        self.assertAlmostEqual(
+            float(summary.get("totalUnusedInventoryTon", 0) or 0),
+            sum_unused,
+            places=4,
+            msg="summary.totalUnusedInventoryTon roll_status eldeki toplamına eşit olmalı",
+        )
+
+    def test_summary_cost_components_sum_to_total_cost(self):
+        """costFireLira + costStockLira + costSetupLira + costSequencePenaltyLira ≈ totalCost."""
+        orders = _make_orders([50, 40], panel_width=1.0)
+        rolls = [15, 12, 10]
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=[1.0, 1.0],
+            rolls=rolls,
+            max_orders_per_roll=5,
+            max_rolls_per_order=3,
+            fire_cost=100,
+            setup_cost=100,
+            stock_cost=100,
+            time_limit_seconds=30,
+        )
+        self.assertEqual(status, "Optimal")
+        s = results["summary"]
+        parts = (
+            float(s.get("costFireLira", 0) or 0)
+            + float(s.get("costStockLira", 0) or 0)
+            + float(s.get("costSetupLira", 0) or 0)
+            + float(s.get("costSequencePenaltyLira", 0) or 0)
+        )
+        self.assertAlmostEqual(
+            parts,
+            float(s.get("totalCost", 0) or 0),
+            places=1,
+            msg="Özet maliyet kırılımı totalCost ile uyumlu olmalı",
+        )
+
+    def test_dual_surface_prefers_tighter_roll_pair_when_stock_cost_tie(self):
+        """
+        Dar (5,89 t) ve geniş (6 t) çiftleri varken stok maliyeti toplamı (kullanılmayan R=S) beraberlik
+        verebilir; indeks beraberlik kırıcı ile önce listelenen dar çift seçilmeli ve rapor firesi düşük kalmalı.
+        """
+        orders = _make_orders([1000], panel_width=1.0, panel_length=1.0)
+        rolls = [5.89, 5.89, 6.0, 6.0]
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=[1.0],
+            rolls=rolls,
+            max_orders_per_roll=5,
+            max_rolls_per_order=8,
+            fire_cost=10000,
+            setup_cost=120,
+            stock_cost=1,
+            time_limit_seconds=120,
+            surface_factor=2,
+        )
+        self.assertEqual(status, "Optimal")
+        used_roll_ids = sorted({int(c["rollId"]) for c in results["cuttingPlan"]})
+        self.assertEqual(
+            used_roll_ids,
+            [1, 2],
+            msg="Stok maliyeti beraberliğinde dar bobin çifti (Rulo #1 ve #2) seçilmeli",
+        )
+        self.assertLess(
+            float(results["summary"]["totalFire"]),
+            0.02,
+            msg="Dar bobinlerde kesim sonrası rapor firesi 6 t çiftine göre çok daha düşük olmalı",
         )
 
     def test_half_ton_rule_above_is_stock_below_is_fire(self):
@@ -525,8 +634,7 @@ class TestOptimizationConsistency(unittest.TestCase):
             )
 
     def test_summary_total_cost_matches_fire_stock_setup_sequence(self):
-        """summary.totalCost = fire*totalFire + stock*totalStock + setup*openedRolls + sequencePenalty."""
-        fire_cost, setup_cost, stock_cost = 450.0, 120.0, 2.5
+        """summary.totalCost, TL kırılım satırlarının toplamına eşit (fire + stok tutma + kurulum + sıra cezası)."""
         orders = _make_orders([55, 45], panel_width=1.0)
         status, results = solve_optimization(
             thickness=0.75,
@@ -536,9 +644,9 @@ class TestOptimizationConsistency(unittest.TestCase):
             rolls=[14, 12, 10],
             max_orders_per_roll=5,
             max_rolls_per_order=3,
-            fire_cost=fire_cost,
-            setup_cost=setup_cost,
-            stock_cost=stock_cost,
+            fire_cost=450.0,
+            setup_cost=120.0,
+            stock_cost=2.5,
             time_limit_seconds=30,
             max_interleaving_orders=2,
             interleaving_penalty_cost=50.0,
@@ -546,12 +654,45 @@ class TestOptimizationConsistency(unittest.TestCase):
         self.assertEqual(status, "Optimal")
         s = results["summary"]
         expected = (
-            float(s["totalFire"]) * fire_cost
-            + float(s["totalStock"]) * stock_cost
-            + int(s["openedRolls"]) * setup_cost
-            + float(s["sequencePenalty"])
+            float(s["costFireLira"])
+            + float(s["costStockLira"])
+            + float(s["costSetupLira"])
+            + float(s["costSequencePenaltyLira"])
         )
         self.assertAlmostEqual(float(s["totalCost"]), expected, places=1)
+
+    def test_stock_holding_cost_includes_shelf_unused_tonnage(self):
+        """costStockLira, üretim stoğu + rafta elde ton için h×(totalStock + totalUnused) ile uyumlu olmalı."""
+        orders = _make_orders([55, 45], panel_width=1.0)
+        h = 2.5
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=[1.0, 1.0],
+            rolls=[14, 12, 10],
+            max_orders_per_roll=5,
+            max_rolls_per_order=3,
+            fire_cost=450.0,
+            setup_cost=120.0,
+            stock_cost=h,
+            time_limit_seconds=30,
+        )
+        self.assertEqual(status, "Optimal")
+        s = results["summary"]
+        ton_holding = float(s["totalStock"]) + float(s.get("totalUnusedInventoryTon", 0) or 0)
+        self.assertAlmostEqual(
+            float(s.get("totalStockHoldingTon", 0) or 0),
+            ton_holding,
+            places=4,
+            msg="totalStockHoldingTon = totalStock + totalUnusedInventoryTon",
+        )
+        self.assertAlmostEqual(
+            float(s["costStockLira"]),
+            round(ton_holding * h, 2),
+            places=1,
+            msg="Stok tutma TL, h × (üretim stoku + elde) olmalı",
+        )
 
     def test_standard_lp_cutting_plan_no_repeat_order_per_roll_zero_interleaving(self):
         """Tek (rulo,sipariş) satırı modelinde aynı ruloda sipariş tekrarı yok; sıra ihlali beklenmez."""
