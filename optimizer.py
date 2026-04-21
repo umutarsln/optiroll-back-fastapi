@@ -1,9 +1,6 @@
 """
 Optimizasyon mantığı - Modüler fonksiyonlar
 """
-# Bu eşiğin (ton) altındaki rulo artığı stok değil fire sayılır (iş kuralı).
-MIN_STOCK_THRESHOLD_TON = 0.5
-
 import pulp
 import pandas as pd
 from openpyxl import Workbook
@@ -12,11 +9,73 @@ from datetime import datetime
 import os
 import random
 from collections import defaultdict, deque
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Any, Dict, List, Tuple, Optional, Set, Sequence
 import logging
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
+# Bu eşiğin (ton) altındaki rulo artığı stok değil fire sayılır (iş kuralı).
+MIN_STOCK_THRESHOLD_TON = 0.5
+# Raporlama ve stok/fire ayrımı kg tam sayılarıyla yapılır (1 kg = 0,001 t; LP içi ton sürekli kalır).
+MIN_STOCK_THRESHOLD_KG = int(round(MIN_STOCK_THRESHOLD_TON * 1000.0))
+
+
+def _ton_to_kg_int(ton: float) -> int:
+    """
+    Ton değerini en yakın tam sayı kg'ye çevirir (fiziksel birim kg; bobin kapasitesi burada kesilir).
+
+    Args:
+        ton: Rulo veya miktar (ton).
+
+    Returns:
+        Kilogram cinsinden tam sayı.
+    """
+    return int(round(float(ton) * 1000.0))
+
+
+def _kg_int_to_ton(kg: int) -> float:
+    """
+    Tam sayı kg'yi tona çevirir; ek yuvarlama yok (ton değeri her zaman 0,001'in katıdır).
+
+    Args:
+        kg: Kilogram (tam sayı).
+
+    Returns:
+        Ton cinsinden değer.
+    """
+    return int(kg) / 1000.0
+
+
+def _split_remainder_kg(rem_kg: int) -> Tuple[int, int]:
+    """
+    Açılmış ruloda kalan kg'yi iş kuralına göre fire veya üretim stoğuna böler (eşik MIN_STOCK_THRESHOLD_KG).
+
+    Args:
+        rem_kg: Kapasite (kg) eksi kullanılan (kg); negatifler sıfırlanır.
+
+    Returns:
+        (fire_kg, uretim_stok_kg) tam sayı çifti.
+    """
+    r = max(0, int(rem_kg))
+    if r <= MIN_STOCK_THRESHOLD_KG:
+        return r, 0
+    return 0, r
+
+
+def _split_remainder_for_reporting(rem_ton: float) -> Tuple[float, float]:
+    """
+    Ton cinsinden kalanı kg'ye taşıyıp böler; API ton alanları için (geriye dönük yardımcı).
+
+    Args:
+        rem_ton: Bobin kapasitesi eksi kullanılan (S - u).
+
+    Returns:
+        (fire_ton, uretim_stok_ton).
+    """
+    rem_kg = _ton_to_kg_int(rem_ton)
+    fk, sk = _split_remainder_kg(rem_kg)
+    return _kg_int_to_ton(fk), _kg_int_to_ton(sk)
 
 
 class OptimizationInput(BaseModel):
@@ -1371,7 +1430,7 @@ def solve_optimization(
     density: float,
     orders: List[Dict],
     panel_widths: List[float],
-    rolls: List[int],
+    rolls: List[float],
     max_orders_per_roll: int,
     max_rolls_per_order: int,
     fire_cost: float,
@@ -1386,6 +1445,7 @@ def solve_optimization(
     enforce_surface_sync: bool = False,
     sync_level: str = "dengeli",
     sync_penalty_weight: float = 0.0,
+    roll_open_mask: Optional[Sequence[bool]] = None,
 ) -> Tuple[str, Optional[Dict]]:
     """
     Optimizasyon modelini çöz. Panel uzunluğu ile kesim: uzunluk ve katları (örn. 3m → 3*33+1 fire).
@@ -1398,10 +1458,15 @@ def solve_optimization(
     enforce_surface_sync=True ise çift yüzeyde her sipariş için üstte kullanılan rulo adedi ile altta kullanılan
     rulo adedi eşitlenir (sert kısıt).
     sync_level='dengeli' ise üst/alt bağımsız değişim farklarına ceza eklenebilir.
+    roll_open_mask: ``len(rolls)`` uzunluğunda dizi; ``False`` olan indeksteki rulolar açılamaz
+    (``y[i]=0``). Karşılaştırma testlerinde yalnızca 6 t veya yalnızca 6,4 t aileleri için kullanılır.
     
     Returns:
         (Status, Results dictionary veya None)
     """
+    if roll_open_mask is not None:
+        if len(roll_open_mask) != len(rolls):
+            raise ValueError("roll_open_mask uzunluğu rolls ile aynı olmalıdır.")
     if panel_lengths is None:
         panel_lengths = [1.0] * len(orders)
     elif len(panel_lengths) != len(orders):
@@ -1453,11 +1518,17 @@ def solve_optimization(
     sync_penalty_term = 0
     if dual_surface and sync_level == "dengeli" and sync_penalty_weight > 0:
         sync_penalty_term = pulp.lpSum([sync_diff[j] * sync_penalty_weight for j in J])
+    # Beraberlik kırma: kullanılmayan rulolarda R≈S ile h*R toplamı hangi çiftin açıldığından
+    # bağımsız kalabiliyor; CBC rastgele yüksek indeksli ruloları seçebilir. Küçük ε ile düşük
+    # rollId (indeks) tercih edilir — aynı toplam stok maliyetinde dar bobin (önce listelenen) öne geçer.
+    roll_index_tie_eps = 1e-5
+    roll_index_tie_term = roll_index_tie_eps * pulp.lpSum([(i + 1) * y[i] for i in I])
     model += (
         pulp.lpSum([F[i] * fire_cost for i in I]) +
         pulp.lpSum([R[i] * stock_cost for i in I]) +
         pulp.lpSum([y[i] * setup_cost for i in I]) +
-        sync_penalty_term,
+        sync_penalty_term +
+        roll_index_tie_term,
         "Toplam_Maliyet",
     )
     
@@ -1573,14 +1644,39 @@ def solve_optimization(
     for i in I:
         model += R[i] + F[i] == S[i] - u[i], f"Denge_{i}"
     
-    # Stok/Fire ayrımı - gevşetilmiş
-    # b_i = 1 ise "Stok" (parça > 0), b_i = 0 ise "Fire"
-    # Fire üst sınırı kaldırıldı - daha fazla esneklik
-    EPS = 0.01
+    # Stok/Fire ayrımı: R[i] >= EPS*b[i] ile b=1 iken R en az EPS olmalı.
+    # EPS=0.01 sabitken kalan (S-u) < 0.01 t olduğunda b=1 ile dengeli değil; çözücü b=0 zorlar,
+    # küçük kalanı tamamen F'ye yazar — yüksek cf ile dar bobin (5,89 t) dalı pahalı görünür.
+    s_min_cap = min(float(S[ii]) for ii in I) if I else 1.0
+    EPS = max(1e-7, min(0.01, s_min_cap * 1e-6, min_demand * 1e-6))
     for i in I:
         model += R[i] <= S[i] * b[i], f"Stok_ust_{i}"
         model += R[i] >= EPS * b[i], f"Stok_alt_{i}"
         model += F[i] <= S[i] * (1 - b[i]), f"Fire_ust_{i}"
+    # Açılmayan rulo (y=0): kesim firesi yok; bobin rafta → F=0, R=S−u ve h×R ile stok tutma (raporla uyum).
+    for i in I:
+        model += F[i] <= S[i] * y[i], f"Fire_sadece_acilan_ruloda_{i}"
+    # Rapor 0,5 t kuralı ile aynı: kalan (S−u) ≤ 0,5 ise b=0 (tamamı fire maliyeti cf), aksi halde b=1 (tamamı h).
+    # Açılmayan ruloda (1−y) ile kısıtlar gevşetilir; y=0 iken F=0 zaten R=S zorlar.
+    s_max_cap = max((float(S[ii]) for ii in I), default=1.0)
+    M_rem = 2.0 * s_max_cap + 10.0
+    T_rem = float(MIN_STOCK_THRESHOLD_TON)
+    eps_rem = 1e-4
+    for i in I:
+        rem_lin = S[i] - u[i]
+        model += (
+            rem_lin <= T_rem + M_rem * b[i] + M_rem * (1 - y[i]),
+            f"Rem_fire_stok_esik_ust_{i}",
+        )
+        model += (
+            rem_lin >= T_rem + eps_rem - M_rem * (1 - b[i]) - M_rem * (1 - y[i]),
+            f"Rem_fire_stok_esik_alt_{i}",
+        )
+
+    if roll_open_mask is not None:
+        for i in I:
+            if not bool(roll_open_mask[i]):
+                model += y[i] == 0, f"Rulo_acma_yasak_{i}"
     
     # Modeli çöz (main.py'deki optimize parametrelerle)
     import multiprocessing
@@ -1679,39 +1775,81 @@ def solve_optimization(
             "remaining": round(S[i] - kullanilan, 4),
             "fire": round(fire, 4),
             "stock": round(stok, 4),
-            "ordersUsed": kullanilan_siparis
+            "ordersUsed": kullanilan_siparis,
+            "unusedRollTonnage": 0.0,
         })
     
-    # İş kuralı: Kalan miktar 0,5 ton üstüyse stoğa, 0,5 ton ve altı fire sayılır
-    toplam_fire = 0.0
-    toplam_stok = 0.0
-    for item in roll_status:
-        kalan = float(item["stock"]) + float(item["fire"])
-        if kalan > MIN_STOCK_THRESHOLD_TON:
-            item["stock"] = round(kalan, 4)
-            item["fire"] = 0.0
-            toplam_stok += kalan
-        else:
+    # Raporlama: bobin kapasitesi ve kalanlar kg tam sayı defterine yazılır (ton = kg/1000); 0,5 t eşiği kg ile.
+    # LP'nin R/F/b seçimi burada yok sayılır — cf yüksekken küçük artığı "stok" göstermemek için.
+    # Açılmamış rulo: üretim fire/stoku yok; bobin rafta → unusedRollTonnage = kapasite (kg defteri).
+    toplam_fire_kg = 0
+    toplam_stok_kg = 0
+    toplam_eldeki_kg = 0
+    for idx, i in enumerate(I):
+        item = roll_status[idx]
+        cap_kg = _ton_to_kg_int(float(S[i]))
+        cap_ton = _kg_int_to_ton(cap_kg)
+        y_val = float(pulp.value(y[i]) or 0.0)
+        if y_val <= 0.5:
+            item["totalTonnage"] = cap_ton
+            item["used"] = 0.0
+            item["remaining"] = cap_ton
             item["stock"] = 0.0
-            item["fire"] = round(kalan, 4)
-            toplam_fire += kalan
-    
+            item["fire"] = 0.0
+            item["unusedRollTonnage"] = cap_ton
+            toplam_eldeki_kg += cap_kg
+            continue
+        used_val = float(pulp.value(u[i]) or 0.0)
+        used_kg = min(cap_kg, max(0, _ton_to_kg_int(used_val)))
+        rem_kg = cap_kg - used_kg
+        fire_kg, stock_kg = _split_remainder_kg(rem_kg)
+        used_kg = cap_kg - fire_kg - stock_kg
+        item["totalTonnage"] = cap_ton
+        item["unusedRollTonnage"] = 0.0
+        item["used"] = _kg_int_to_ton(used_kg)
+        item["fire"] = _kg_int_to_ton(fire_kg)
+        item["stock"] = _kg_int_to_ton(stock_kg)
+        item["remaining"] = _kg_int_to_ton(fire_kg + stock_kg)
+        toplam_fire_kg += fire_kg
+        toplam_stok_kg += stock_kg
+
+    toplam_fire = _kg_int_to_ton(toplam_fire_kg)
+    toplam_stok = _kg_int_to_ton(toplam_stok_kg)
+    toplam_eldeki = _kg_int_to_ton(toplam_eldeki_kg)
+
     acilan_rulo = sum([1 for i in I if pulp.value(y[i]) > 0.5])
-    # Fire/stok yeniden sınıflandığı için maliyeti buna göre güncelle
-    guncel_maliyet = (
-        toplam_fire * fire_cost
-        + toplam_stok * stock_cost
-        + acilan_rulo * setup_cost
-        + sequence_penalty
+    # Stok tutma (h): hem açılmış rulodaki üretim stoğu (kalan > 0,5 t) hem açılmamış rafta bobin (elde).
+    toplam_stok_tutma_ton = toplam_stok + toplam_eldeki
+    cost_fire_lira = round(toplam_fire * fire_cost, 2)
+    cost_stock_lira = round(toplam_stok_tutma_ton * stock_cost, 2)
+    cost_stock_production_lira = round(toplam_stok * stock_cost, 2)
+    cost_stock_shelf_lira = max(0.0, round(cost_stock_lira - cost_stock_production_lira, 2))
+    cost_setup_lira = round(acilan_rulo * setup_cost, 2)
+    cost_sequence_penalty_lira = round(sequence_penalty, 2)
+    # Fire/stok yeniden sınıflandığı için maliyeti buna göre güncelle (TL satırlarıyla tutarlı).
+    guncel_maliyet = round(
+        float(cost_fire_lira)
+        + float(cost_stock_lira)
+        + float(cost_setup_lira)
+        + float(cost_sequence_penalty_lira),
+        2,
     )
 
     summary = {
         "totalCost": round(guncel_maliyet, 2),
-        "totalFire": round(toplam_fire, 4),
-        "totalStock": round(toplam_stok, 4),
+        "totalFire": toplam_fire,
+        "totalStock": toplam_stok,
+        "totalUnusedInventoryTon": toplam_eldeki,
+        "totalStockHoldingTon": round(toplam_stok_tutma_ton, 6),
         "openedRolls": acilan_rulo,
         "sequencePenalty": round(sequence_penalty, 4),
         "interleavingViolationCount": len(sequence_violations),
+        "costFireLira": cost_fire_lira,
+        "costStockLira": cost_stock_lira,
+        "costStockProductionLira": cost_stock_production_lira,
+        "costStockShelfLira": cost_stock_shelf_lira,
+        "costSetupLira": cost_setup_lira,
+        "costSequencePenaltyLira": cost_sequence_penalty_lira,
     }
     sync_metrics = calculate_roll_change_and_sync_metrics(cutting_plan)
     summary["rollChangeCount"] = sync_metrics["rollChangeCount"]
@@ -1777,195 +1915,87 @@ def solve_optimization(
     return status, results
 
 
-def create_excel_report(results: Dict, file_id: str) -> str:
+def create_excel_report(
+    results: Dict[str, Any],
+    file_id: str,
+    *,
+    scenario_meta: Dict[str, Any],
+) -> str:
     """
-    Excel raporu oluştur
-    
-    Args:
-        results: Optimizasyon sonuçları
-        file_id: Dosya ID
-    
-    Returns:
-        Dosya yolu
-    """
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, PatternFill
-    
-    wb = Workbook()
-    wb.remove(wb.active)
-    
-    data = results['data']
-    I = data['I']
-    J = data['J']
-    S = data['S']
-    D = data['D']
-    panel_widths = data['panel_widths']
-    orders = data['orders']
-    n_orders = len(orders)
-    panel_lengths = data.get('panel_lengths') or [1.0] * n_orders
-    if len(panel_lengths) < n_orders:
-        panel_lengths = panel_lengths + [1.0] * (n_orders - len(panel_lengths))
-    thickness = data['thickness']
-    density = data['density']
+    Dashboard optimizasyonu için tez raporu şablonuyla Excel üretir: ayrıntılı sayfalar,
+    üretim adımları ve gömülü grafikler (kesim şeması, üretim adımları, maliyet kırılımı).
 
-    # SAYFA 1: KULLANICI VERİ GİRİŞİ
-    ws_veri = wb.create_sheet("Kullanici_Veri_Girisi", 0)
-    ws_veri['A1'] = "KULLANICI VERİ GİRİŞİ"
-    ws_veri['A1'].font = Font(bold=True, size=14)
-    ws_veri.merge_cells('A1:B1')
-    
-    row = 3
-    ws_veri.cell(row=row, column=1, value="MALZEME ÖZELLİKLERİ").font = Font(bold=True, size=12)
-    ws_veri.merge_cells(f'A{row}:B{row}')
-    row += 1
-    ws_veri.cell(row=row, column=1, value="Kalınlık (mm)").font = Font(bold=True)
-    ws_veri.cell(row=row, column=2, value=thickness)
-    row += 1
-    ws_veri.cell(row=row, column=1, value="Yoğunluk (g/cm³)").font = Font(bold=True)
-    ws_veri.cell(row=row, column=2, value=density)
-    row += 2
-    
-    ws_veri.cell(row=row, column=1, value="RULO TONAJLARI (Ton)").font = Font(bold=True, size=12)
-    ws_veri.merge_cells(f'A{row}:B{row}')
-    row += 1
-    ws_veri.cell(row=row, column=1, value="Rulo No").font = Font(bold=True)
-    ws_veri.cell(row=row, column=2, value="Tonaj (Ton)").font = Font(bold=True)
-    row += 1
-    for i in I:
-        ws_veri.cell(row=row, column=1, value=f"Rulo {i+1}")
-        ws_veri.cell(row=row, column=2, value=S[i])
-        row += 1
-    row += 1
-    
-    ws_veri.cell(row=row, column=1, value="SİPARİŞ MİKTARLARI (m²)").font = Font(bold=True, size=12)
-    ws_veri.merge_cells(f'A{row}:D{row}')
-    row += 1
-    ws_veri.cell(row=row, column=1, value="Sipariş No").font = Font(bold=True)
-    ws_veri.cell(row=row, column=2, value="Miktar (m²)").font = Font(bold=True)
-    ws_veri.cell(row=row, column=3, value="Panel Genişliği (m)").font = Font(bold=True)
-    ws_veri.cell(row=row, column=4, value="Panel Uzunluğu (m)").font = Font(bold=True)
-    row += 1
-    for j in J:
-        ws_veri.cell(row=row, column=1, value=f"Sipariş {j+1}")
-        ws_veri.cell(row=row, column=2, value=orders[j]['m2'])
-        ws_veri.cell(row=row, column=3, value=panel_widths[j])
-        ws_veri.cell(row=row, column=4, value=panel_lengths[j] if j < len(panel_lengths) else 1.0)
-        row += 1
-    
-    ws_veri.column_dimensions['A'].width = 35
-    ws_veri.column_dimensions['B'].width = 20
-    ws_veri.column_dimensions['C'].width = 20
-    ws_veri.column_dimensions['D'].width = 20
-    
-    # SAYFA 2: ÖZET
-    ws_ozet = wb.create_sheet("Ozet")
-    ws_ozet['A1'] = "KESME STOKU OPTİMİZASYON RAPORU - ÖZET"
-    ws_ozet['A1'].font = Font(bold=True, size=14)
-    ws_ozet.merge_cells('A1:B1')
-    
-    sum_row = results["summary"]
-    seq_pen = float(sum_row.get("sequencePenalty", 0) or 0)
-    viol_n = int(sum_row.get("interleavingViolationCount", 0) or 0)
-    ozet_data = [
-        ["Metrik", "Değer"],
-        ["Toplam Maliyet", f"{sum_row['totalCost']:.2f}"],
-        ["Sıra Cezası (siparişe dönüş)", f"{seq_pen:.4f}"],
-        ["Sıra İhlal Sayısı", str(viol_n)],
-        ["Toplam Fire (Ton)", f"{sum_row['totalFire']:.4f}"],
-        ["Toplam Stok (Ton)", f"{sum_row['totalStock']:.4f}"],
-        ["Açılan Rulo Sayısı", f"{sum_row['openedRolls']}"],
-    ]
-    
-    for row_idx, row_data in enumerate(ozet_data, start=3):
-        for col_idx, value in enumerate(row_data, start=1):
-            cell = ws_ozet.cell(row=row_idx, column=col_idx, value=value)
-            if row_idx == 3:
-                cell.font = Font(bold=True)
-                cell.fill = PatternFill(start_color="CCCCCC", end_color="CCCCCC", fill_type="solid")
-    
-    ws_ozet.column_dimensions['A'].width = 25
-    ws_ozet.column_dimensions['B'].width = 20
-    
-    # SAYFA 3: KESİM PLANI
-    ws_kesim = wb.create_sheet("Kesim_Plani")
-    ws_kesim['A1'] = "KESİM PLANI"
-    ws_kesim['A1'].font = Font(bold=True, size=14)
-    ws_kesim.merge_cells('A1:H1')
-    
-    kesim_data = [["Sipariş ID", "Rulo ID", "Panel Sayısı", "Panel Genişliği (m)", "Panel Uzunluğu (m)",
-                   "Kesilen Miktar (Ton)", "Kesilen Miktar (m²)", "Sipariş Toplam (Ton)"]]
-    
-    for item in results['cuttingPlan']:
-        pl = item.get('panelLength', 1.0)
-        kesim_data.append([
-            f"Sipariş {item['orderId']}",
-            f"Rulo {item['rollId']}",
-            f"{item['panelCount']}",
-            f"{item['panelWidth']:.2f}",
-            f"{pl:.2f}",
-            f"{item['tonnage']:.4f}",
-            f"{item['m2']:.2f}",
-            f"{D[item['orderId']-1]:.4f}"
-        ])
-    
-    for row_idx, row_data in enumerate(kesim_data, start=3):
-        for col_idx, value in enumerate(row_data, start=1):
-            cell = ws_kesim.cell(row=row_idx, column=col_idx, value=value)
-            if row_idx == 3:
-                cell.font = Font(bold=True)
-                cell.fill = PatternFill(start_color="CCCCCC", end_color="CCCCCC", fill_type="solid")
-    
-    for col in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
-        ws_kesim.column_dimensions[col].width = 20
-    
-    # SAYFA 4: RULO DURUMU
-    ws_rulo = wb.create_sheet("Rulo_Durumu")
-    ws_rulo['A1'] = "RULO DURUMU"
-    ws_rulo['A1'].font = Font(bold=True, size=14)
-    ws_rulo.merge_cells('A1:H1')
-    
-    rulo_data = [["Rulo ID", "Başlangıç Kapasitesi (Ton)", "Kullanılan (Ton)", 
-                  "Kalan (Ton)", "Stok (Ton)", "Fire (Ton)", "Kullanılan Sipariş Sayısı", "Durum"]]
-    
-    for item in results['rollStatus']:
-        if item['fire'] > 0.0001:
-            durum = "Fire"
-        elif item['stock'] > 0.0001:
-            durum = "Stok"
-        elif item['used'] > 0.0001:
-            durum = "Tamamen Kullanıldı"
-        else:
-            durum = "Kullanılmadı"
-        
-        rulo_data.append([
-            f"Rulo {item['rollId']}",
-            f"{item['totalTonnage']:.2f}",
-            f"{item['used']:.4f}",
-            f"{item['remaining']:.4f}",
-            f"{item['stock']:.4f}",
-            f"{item['fire']:.4f}",
-            f"{item['ordersUsed']}/{data['max_orders_per_roll']}",
-            durum
-        ])
-    
-    for row_idx, row_data in enumerate(rulo_data, start=3):
-        for col_idx, value in enumerate(row_data, start=1):
-            cell = ws_rulo.cell(row=row_idx, column=col_idx, value=value)
-            if row_idx == 3:
-                cell.font = Font(bold=True)
-                cell.fill = PatternFill(start_color="CCCCCC", end_color="CCCCCC", fill_type="solid")
-    
-    for col in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
-        ws_rulo.column_dimensions[col].width = 20
-    
-    # Dosyayı kaydet
+    Args:
+        results: solve_optimization çıktısı
+        file_id: Çalıştırma dosya kimliği (dosya adı için)
+        scenario_meta: thesis_xlsx_report.scenario_meta_from_dashboard_inputs çıktısı
+
+    Returns:
+        Yazılan .xlsx dosyasının tam yolu
+    """
+    from thesis_chart_builder import (
+        kesim_semasi_from_results,
+        stacked_bar_kirilim,
+        uretim_adimlari_grafigi_from_results,
+    )
+    from thesis_xlsx_report import build_cozum_raporu_xlsx, sonuc_from_optimizer_results
+
+    sonuc = sonuc_from_optimizer_results(results)
     sonuclar_klasoru = "sonuclar"
     if not os.path.exists(sonuclar_klasoru):
         os.makedirs(sonuclar_klasoru)
-    
+
+    grafik_klasor = os.path.join(sonuclar_klasoru, f"grafik_{file_id}")
+    os.makedirs(grafik_klasor, exist_ok=True)
+
+    baslik_orta = str(scenario_meta.get("senaryo_adi") or "Çözüm")
+    alt_b = str(scenario_meta.get("aciklama") or "")
+
+    kesim_png = kesim_semasi_from_results(
+        results,
+        os.path.join(grafik_klasor, "kesim_semasi.png"),
+        baslik=f"Kesim Şeması — {baslik_orta}",
+        alt_baslik=alt_b,
+    )
+    adim_png = uretim_adimlari_grafigi_from_results(
+        results,
+        os.path.join(grafik_klasor, "uretim_adimlari.png"),
+        baslik=f"Üretim Adımları — {baslik_orta}",
+        alt_baslik=alt_b,
+    )
+
+    maliyet_png: Optional[str] = None
+    m = scenario_meta.get("maliyetler") or {}
+    sm = results.get("summary") or {}
+    tf = float(sm.get("totalFire", 0.0) or 0.0)
+    ts = float(sm.get("totalStock", 0.0) or 0.0)
+    opened = int(sm.get("openedRolls", 0) or 0)
+    fc = float(m.get("fire_cost", 0) or 0)
+    sc = float(m.get("stock_cost", 0) or 0)
+    scu = float(m.get("setup_cost", 0) or 0)
+    fm = tf * fc
+    stm = ts * sc
+    suma = opened * scu
+    try:
+        maliyet_png = stacked_bar_kirilim(
+            ["Çözüm"],
+            {"fire": [fm], "stok": [stm], "setup": [suma]},
+            os.path.join(grafik_klasor, "maliyet_kirilim.png"),
+            baslik="Maliyet kırılımı (fire + stok + rulo açma)",
+            y_label="Maliyet",
+            alt_baslik=alt_b,
+        )
+    except Exception as exc:
+        logger.warning("Maliyet kırılım grafiği oluşturulamadı: %s", str(exc))
+
+    embed = [p for p in (kesim_png, adim_png, maliyet_png) if p]
     excel_path = os.path.join(sonuclar_klasoru, f"cozum_raporu_{file_id}.xlsx")
-    wb.save(excel_path)
-    
+    build_cozum_raporu_xlsx(
+        scenario_meta,
+        sonuc,
+        excel_path,
+        grafik_yollari=embed if embed else None,
+    )
     return excel_path
 
 
