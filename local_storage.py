@@ -44,6 +44,10 @@ def _parse_excel_run(file_path: str, file_id: str) -> Optional[Dict]:
 
         if "Kesim_Plani" in wb.sheetnames:
             ws = wb["Kesim_Plani"]
+            h3 = ws.cell(row=3, column=3).value
+            h3s = str(h3 or "").lower()
+            # thesis_xlsx_report: Ton/m² önce; eski optimizer: Panel sayısı/genişlik önce
+            yeni_kesim_plani = "kesilen" in h3s and "ton" in h3s
             for row in range(4, ws.max_row + 1):
                 siparis_cell = ws.cell(row=row, column=1).value
                 if not siparis_cell or "Sipariş" not in str(siparis_cell):
@@ -54,10 +58,16 @@ def _parse_excel_run(file_path: str, file_id: str) -> Optional[Dict]:
                     continue
                 rulo_str = ws.cell(row=row, column=2).value or ""
                 roll_id = int(str(rulo_str).replace("Rulo", "").strip()) if rulo_str else 0
-                panel_count = _to_float(ws.cell(row=row, column=3).value) or 0
-                panel_width = _to_float(ws.cell(row=row, column=4).value) or 0
-                tonnage = _to_float(ws.cell(row=row, column=5).value) or 0
-                m2 = _to_float(ws.cell(row=row, column=6).value) or 0
+                if yeni_kesim_plani:
+                    tonnage = _to_float(ws.cell(row=row, column=3).value) or 0
+                    m2 = _to_float(ws.cell(row=row, column=4).value) or 0
+                    panel_count = _to_float(ws.cell(row=row, column=5).value) or 0
+                    panel_width = _to_float(ws.cell(row=row, column=6).value) or 0
+                else:
+                    panel_count = _to_float(ws.cell(row=row, column=3).value) or 0
+                    panel_width = _to_float(ws.cell(row=row, column=4).value) or 0
+                    tonnage = _to_float(ws.cell(row=row, column=5).value) or 0
+                    m2 = _to_float(ws.cell(row=row, column=6).value) or 0
                 cutting_plan.append({
                     "orderId": order_id,
                     "rollId": roll_id,
