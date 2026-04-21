@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import List, Dict, Optional, Literal, Tuple
+from typing import Any, List, Dict, Optional, Literal, Tuple
 import uuid
 import os
 from optimizer import (
@@ -24,6 +24,18 @@ from optimizer import (
     solve_optimization,
     create_excel_report,
 )
+from thesis_failure_codes import (
+    CAPACITY_LT_DEMAND,
+    INFEASIBLE_UNKNOWN,
+    INVALID_MATERIAL,
+    INVALID_ROLLS,
+    MAX_ROLLS_PER_ORDER_RULE,
+    NO_ORDERS,
+    classify_infeasible_structure,
+    hints_for_code,
+)
+from thesis_xlsx_report import scenario_meta_from_dashboard_inputs
+
 from supabase_client import (
     SupabaseTransportError,
     SupabaseWriteError,
@@ -83,6 +95,33 @@ def _enforce_customer_request_post_rate_limit(request: Request) -> None:
                 detail="Çok fazla istek. Lütfen bir süre sonra tekrar deneyin.",
             )
         times.append(now)
+
+
+def _optimization_error_detail(
+    message: str,
+    failure_code: Optional[str] = None,
+    extra_hints: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    /api/optimize JSON hata gövdesi: message, failureCode, hints (frontend toast için).
+
+    Args:
+        message: Kullanıcıya gösterilecek ana metin
+        failure_code: Makine kodu (thesis_failure_codes)
+        extra_hints: Koda özel ek ipuçları
+
+    Returns:
+        FastAPI detail sözlüğü
+    """
+    hints: List[str] = []
+    if failure_code:
+        hints.extend(hints_for_code(failure_code))
+    if extra_hints:
+        hints.extend(extra_hints)
+    out: Dict[str, Any] = {"message": message, "hints": hints}
+    if failure_code:
+        out["failureCode"] = failure_code
+    return out
 
 
 def _get_run_row_or_http_exception(file_id: str) -> Dict:
@@ -264,9 +303,43 @@ class SummaryResponse(BaseModel):
     totalCost: float
     totalFire: float
     totalStock: float
+    totalUnusedInventoryTon: float = Field(
+        0.0,
+        description="Hiç açılmamış ruloların toplam tonu (rafta kalan bobin).",
+    )
     openedRolls: int
     sequencePenalty: float = 0.0
     interleavingViolationCount: int = 0
+    rollChangeCount: Optional[int] = None
+    surfaceSyncViolations: Optional[int] = None
+    costFireLira: float = Field(
+        0.0,
+        description="Rapor fire tonu × fire maliyeti (cf).",
+    )
+    costStockLira: float = Field(
+        0.0,
+        description="Stok tutma (h × ton): üretim stoğu + rafta elde bobin toplamı.",
+    )
+    totalStockHoldingTon: float = Field(
+        0.0,
+        description="h ile çarpılan toplam ton: totalStock + totalUnusedInventoryTon.",
+    )
+    costStockProductionLira: float = Field(
+        0.0,
+        description="Sadece üretim stoku tonu × h (maliyet kırılımı).",
+    )
+    costStockShelfLira: float = Field(
+        0.0,
+        description="Sadece rafta elde ton × h (maliyet kırılımı).",
+    )
+    costSetupLira: float = Field(
+        0.0,
+        description="Açılan rulo adedi × kurulum (rulo açma) maliyeti.",
+    )
+    costSequencePenaltyLira: float = Field(
+        0.0,
+        description="Sipariş sırası ihlali cezasının TL karşılığı (varsa).",
+    )
 
 
 class SequenceViolationItem(BaseModel):
@@ -290,6 +363,10 @@ class CuttingPlanItem(BaseModel):
 
 
 class RollStatusItem(BaseModel):
+    """
+    Rulo bazlı durum. Ton alanları optimizörde kg tam sayı defterine göre üretilir (her biri 0,001 t katı).
+    """
+
     rollId: int
     totalTonnage: float
     used: float
@@ -297,6 +374,10 @@ class RollStatusItem(BaseModel):
     fire: float
     stock: float
     ordersUsed: int
+    unusedRollTonnage: float = Field(
+        0.0,
+        description="Açılmamış ruloda rafta kalan bobin tonu; açılmış ruloda 0.",
+    )
 
 
 class ModeComparisonItem(BaseModel):
@@ -598,27 +679,52 @@ async def optimize(request: OptimizeRequest):
         # Input validation
         if request.material.thickness <= 0:
             logger.warning("[400] Kalınlık 0'dan büyük olmalıdır (thickness=%s)", request.material.thickness)
-            raise HTTPException(status_code=400, detail="Kalınlık 0'dan büyük olmalıdır")
-        
+            raise HTTPException(
+                status_code=400,
+                detail=_optimization_error_detail(
+                    "Kalınlık 0'dan büyük olmalıdır", failure_code=INVALID_MATERIAL
+                ),
+            )
+
         if request.material.density <= 0:
             logger.warning("[400] Yoğunluk 0'dan büyük olmalıdır (density=%s)", request.material.density)
-            raise HTTPException(status_code=400, detail="Yoğunluk 0'dan büyük olmalıdır")
-        
+            raise HTTPException(
+                status_code=400,
+                detail=_optimization_error_detail(
+                    "Yoğunluk 0'dan büyük olmalıdır", failure_code=INVALID_MATERIAL
+                ),
+            )
+
         if len(request.orders) == 0:
             logger.warning("[400] En az bir sipariş gerekli")
-            raise HTTPException(status_code=400, detail="En az bir sipariş gerekli")
+            raise HTTPException(
+                status_code=400,
+                detail=_optimization_error_detail("En az bir sipariş gerekli", failure_code=NO_ORDERS),
+            )
         
         rs = request.rollSettings
         if rs.rolls and len(rs.rolls) > 0:
-            rolls = [int(round(r)) for r in rs.rolls if r > 0]
+            # Manuel tonajları tam sayıya yuvarlamayın (örn. 5,89 → 6); aksi halde farklı
+            # kapasiteler eşitlenir ve çözücü eş maliyetli rulolar arasında keyfi seçim yapar.
+            rolls = [round(float(r), 4) for r in rs.rolls if r > 0]
             if len(rolls) == 0:
                 logger.warning("[400] Manuel rulo listesi boş veya geçersiz")
-                raise HTTPException(status_code=400, detail="En az bir geçerli rulo tonajı girin")
+                raise HTTPException(
+                    status_code=400,
+                    detail=_optimization_error_detail(
+                        "En az bir geçerli rulo tonajı girin", failure_code=INVALID_ROLLS
+                    ),
+                )
             total_roll_tonnage = sum(rolls)
         else:
             if not rs.totalTonnage or rs.totalTonnage <= 0:
                 logger.warning("[400] Toplam rulo tonajı 0'dan büyük olmalı (totalTonnage=%s)", rs.totalTonnage)
-                raise HTTPException(status_code=400, detail="Toplam rulo tonajı 0'dan büyük olmalıdır")
+                raise HTTPException(
+                    status_code=400,
+                    detail=_optimization_error_detail(
+                        "Toplam rulo tonajı 0'dan büyük olmalıdır", failure_code=INVALID_ROLLS
+                    ),
+                )
             total_roll_tonnage = int(rs.totalTonnage)
             rolls = generate_rolls(total_roll_tonnage, rs.minRollTon, rs.maxRollTon)
         
@@ -632,7 +738,10 @@ async def optimize(request: OptimizeRequest):
             )
             raise HTTPException(
                 status_code=400,
-                detail="Çift yüzey senaryosunda maksimum rulo/sipariş en az 2 olmalıdır",
+                detail=_optimization_error_detail(
+                    "Çift yüzey senaryosunda maksimum rulo/sipariş en az 2 olmalıdır",
+                    failure_code=MAX_ROLLS_PER_ORDER_RULE,
+                ),
             )
         
         # Panel genişlik ve uzunluklarını kontrol et
@@ -662,7 +771,10 @@ async def optimize(request: OptimizeRequest):
         if total_roll_tonnage < total_tonnage_needed - 0.01:
             detail = f"Toplam rulo tonajı ({total_roll_tonnage:.2f}) ihtiyaçtan ({total_tonnage_needed:.2f}) az olamaz"
             logger.warning("[400] %s", detail)
-            raise HTTPException(status_code=400, detail=detail)
+            raise HTTPException(
+                status_code=400,
+                detail=_optimization_error_detail(detail, failure_code=CAPACITY_LT_DEMAND),
+            )
 
         selected_modes = _resolve_strategy_modes(request)
         selected_sync_levels = _resolve_sync_levels(request)
@@ -712,7 +824,22 @@ async def optimize(request: OptimizeRequest):
                     break
         if selected_sync is None:
             status = sync_status_results[0][1] if sync_status_results else "Infeasible"
-            raise HTTPException(status_code=400, detail=f"Senkron seviyesi için çözüm üretilemedi. Durum: {status}")
+            fail_level = sync_status_results[0][0] if sync_status_results else "dengeli"
+            sp = _build_sync_profile(fail_level)
+            code, _ = classify_infeasible_structure(
+                rolls=rolls,
+                num_orders=len(orders_list),
+                max_orders_per_roll=int(anchor_profile["max_orders_per_roll"]),
+                max_rolls_per_order=int(anchor_profile["max_rolls_per_order"]),
+                surface_factor=SURFACE_FACTOR_OPTIMIZE,
+                enforce_surface_sync=bool(sp["enforce_surface_sync"]),
+            )
+            fc = code if status == "Infeasible" else INFEASIBLE_UNKNOWN
+            msg = f"Senkron seviyesi için çözüm üretilemedi. Durum: {status}"
+            raise HTTPException(
+                status_code=400,
+                detail=_optimization_error_detail(msg, failure_code=fc),
+            )
         selected_sync_level, _, _ = selected_sync
         selected_sync_profile = _build_sync_profile(selected_sync_level)
 
@@ -770,7 +897,20 @@ async def optimize(request: OptimizeRequest):
                     total_roll_tonnage, len(rolls), total_tonnage_needed,
                     request.rollSettings.maxOrdersPerRoll, request.rollSettings.maxRollsPerOrder
                 )
-                raise HTTPException(status_code=400, detail=detail_msg)
+                prof = _build_mode_profile(mode_status_results[0][0], request) if mode_status_results else anchor_profile
+                code, _ = classify_infeasible_structure(
+                    rolls=rolls,
+                    num_orders=len(orders_list),
+                    max_orders_per_roll=int(prof["max_orders_per_roll"]),
+                    max_rolls_per_order=int(prof["max_rolls_per_order"]),
+                    surface_factor=SURFACE_FACTOR_OPTIMIZE,
+                    enforce_surface_sync=bool(selected_sync_profile["enforce_surface_sync"]),
+                )
+                fc = code if status == "Infeasible" else INFEASIBLE_UNKNOWN
+                raise HTTPException(
+                    status_code=400,
+                    detail=_optimization_error_detail(detail_msg, failure_code=fc),
+                )
             selected_mode, status, results = selected
         else:
             status, results = solve_optimization(
@@ -795,7 +935,20 @@ async def optimize(request: OptimizeRequest):
                 sync_penalty_weight=float(selected_sync_profile["sync_penalty_weight"]),
             )
             if status != "Optimal" or results is None:
-                raise HTTPException(status_code=400, detail=f"Optimizasyon çözülemedi. Durum: {status}")
+                code, _ = classify_infeasible_structure(
+                    rolls=rolls,
+                    num_orders=len(orders_list),
+                    max_orders_per_roll=int(anchor_profile["max_orders_per_roll"]),
+                    max_rolls_per_order=int(anchor_profile["max_rolls_per_order"]),
+                    surface_factor=SURFACE_FACTOR_OPTIMIZE,
+                    enforce_surface_sync=bool(selected_sync_profile["enforce_surface_sync"]),
+                )
+                fc = code if status == "Infeasible" else INFEASIBLE_UNKNOWN
+                msg = f"Optimizasyon çözülemedi. Durum: {status}"
+                raise HTTPException(
+                    status_code=400,
+                    detail=_optimization_error_detail(msg, failure_code=fc),
+                )
         
         file_id = uuid.uuid4().hex[:16]
         input_data = {
@@ -836,7 +989,32 @@ async def optimize(request: OptimizeRequest):
         if save_to_db is None:
             save_to_db = True
         if save_to_db:
-            excel_path = create_excel_report(results, file_id)
+            senaryo_baslik = (run_description or "Optimizasyon çalıştırması")[:500]
+            aciklama_parcalari: List[str] = []
+            if selected_sync_level:
+                aciklama_parcalari.append(f"Senkron seviye: {selected_sync_level}")
+            if selected_mode:
+                aciklama_parcalari.append(f"Strateji modu: {selected_mode}")
+            aciklama_dashboard = " | ".join(aciklama_parcalari) if aciklama_parcalari else None
+            dashboard_meta = scenario_meta_from_dashboard_inputs(
+                senaryo_adi=senaryo_baslik,
+                kalinlik_mm=float(request.material.thickness),
+                yogunluk_g_cm3=float(request.material.density),
+                rulolar_ton=[float(x) for x in rolls],
+                siparisler=orders_list,
+                fire_cost=float(request.costs.fireCost),
+                setup_cost=float(request.costs.setupCost),
+                stock_cost=float(request.costs.stockCost),
+                toplam_talep_ton=float(total_tonnage_needed),
+                toplam_rulo_kapasitesi_ton=float(total_roll_tonnage),
+                guvenlik_payi=float(request.safetyStock)
+                if request.safetyStock is not None
+                else None,
+                max_siparis_per_rulo=int(request.rollSettings.maxOrdersPerRoll),
+                max_rulo_per_siparis=int(request.rollSettings.maxRollsPerOrder),
+                aciklama=aciklama_dashboard,
+            )
+            excel_path = create_excel_report(results, file_id, scenario_meta=dashboard_meta)
             save_optimization_result(
                 file_id=file_id,
                 input_data=input_data,
