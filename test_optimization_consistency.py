@@ -740,6 +740,102 @@ class TestOptimizationConsistency(unittest.TestCase):
         self.assertAlmostEqual(penalty, 7.0, places=4)
         self.assertTrue(any(v["orderId"] == 1 and v["excess"] == 1 for v in violations))
 
+    def test_dual_surface_exact_meter_closure_and_r4_match_regression(self):
+        """
+        Regresyon: 1200/800 m² çift yüzey senaryosunda sipariş kapanışları taşmamalı,
+        adım toplamları kesim planıyla tutarlı olmalı ve 800 m² için R4 tam eşleşmesi en az bir yüzeyde görünmeli.
+        """
+        orders = _make_orders([1200, 800], panel_width=1.0, panel_length=1.0)
+        rolls = [11.775, 7.065, 5.8875, 4.71, 2.94375]
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=[1.0, 1.0],
+            panel_lengths=[1.0, 1.0],
+            rolls=rolls,
+            max_orders_per_roll=5,
+            max_rolls_per_order=5,
+            fire_cost=450,
+            setup_cost=120,
+            stock_cost=2.5,
+            time_limit_seconds=45,
+            surface_factor=2.0,
+            sync_level="siki",
+        )
+        self.assertEqual(status, "Optimal")
+        cutting_plan = results["cuttingPlan"]
+        line_schedule = results.get("lineSchedule", [])
+
+        target_m2 = {1: 1200.0, 2: 800.0}
+        plan_upper_m2 = {1: 0.0, 2: 0.0}
+        plan_lower_m2 = {1: 0.0, 2: 0.0}
+        has_exact_800_match_for_order2 = False
+        for row in cutting_plan:
+            oid = int(row["orderId"])
+            total_ton = float(row.get("tonnage", 0.0) or 0.0)
+            row_m2 = float(row.get("m2", 0.0) or 0.0)
+            upper_ton = float(row.get("upperTonnage", 0.0) or 0.0)
+            lower_ton = float(row.get("lowerTonnage", 0.0) or 0.0)
+            if total_ton > 1e-9 and upper_ton > 1e-9:
+                plan_upper_m2[oid] += row_m2 * (upper_ton / total_ton)
+            if total_ton > 1e-9 and lower_ton > 1e-9:
+                plan_lower_m2[oid] += row_m2 * (lower_ton / total_ton)
+            if oid == 2 and (upper_ton > 1e-6 or lower_ton > 1e-6) and abs(row_m2 - 800.0) <= 0.05:
+                has_exact_800_match_for_order2 = True
+
+        step_upper_m2 = {1: 0.0, 2: 0.0}
+        step_lower_m2 = {1: 0.0, 2: 0.0}
+        for step in line_schedule:
+            for cut in step.get("cuts", []):
+                oid = int(cut.get("orderId", 0))
+                c_m2 = float(cut.get("m2", 0.0) or 0.0)
+                if float(cut.get("upperTonnage", 0.0) or 0.0) > 1e-9:
+                    step_upper_m2[oid] += c_m2
+                if float(cut.get("lowerTonnage", 0.0) or 0.0) > 1e-9:
+                    step_lower_m2[oid] += c_m2
+
+        for oid, tgt in target_m2.items():
+            self.assertLessEqual(
+                plan_upper_m2[oid],
+                tgt + 0.05,
+                msg=f"S{oid} üst yüzey plan m² taşmamalı",
+            )
+            self.assertLessEqual(
+                plan_lower_m2[oid],
+                tgt + 0.05,
+                msg=f"S{oid} alt yüzey plan m² taşmamalı",
+            )
+            self.assertAlmostEqual(
+                plan_upper_m2[oid],
+                tgt,
+                places=2,
+                msg=f"S{oid} üst yüzey m² hedefe kapanmalı",
+            )
+            self.assertAlmostEqual(
+                plan_lower_m2[oid],
+                tgt,
+                places=2,
+                msg=f"S{oid} alt yüzey m² hedefe kapanmalı",
+            )
+            self.assertAlmostEqual(
+                step_upper_m2[oid],
+                plan_upper_m2[oid],
+                places=2,
+                msg=f"S{oid} üst yüzey lineSchedule m² planla uyumlu olmalı",
+            )
+            self.assertAlmostEqual(
+                step_lower_m2[oid],
+                plan_lower_m2[oid],
+                places=2,
+                msg=f"S{oid} alt yüzey lineSchedule m² planla uyumlu olmalı",
+            )
+
+        self.assertTrue(
+            has_exact_800_match_for_order2,
+            "S2 için en az bir 800 m² tam eşleşme dilimi görünmeli",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

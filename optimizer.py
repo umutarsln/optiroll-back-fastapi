@@ -513,11 +513,17 @@ def _rows_to_surface_queue(rows: List[Dict], is_upper: bool) -> deque:
         if t < 1e-9:
             continue
         row_m2 = float(r.get("m2") or 0.0)
+        ton_kg = _ton_to_kg_int(t)
+        if ton_kg <= 0:
+            continue
         m2_alloc = row_m2 * (t / row_ton) if row_ton > 1e-9 else row_m2
+        m2_per_kg = (m2_alloc / ton_kg) if ton_kg > 0 else 0.0
         q.append({
             "rollId": int(r["rollId"]),
             "ton": float(t),
+            "tonKg": int(ton_kg),
             "m2": float(m2_alloc),
+            "m2PerKg": float(m2_per_kg),
         })
     return q
 
@@ -623,37 +629,38 @@ def build_symmetric_steps_for_order(
             sum_l,
         )
     steps: List[Dict] = []
-    eps = 1e-6
+    eps = 1e-9
     while uq and lq:
         u = uq[0]
         l = lq[0]
-        step = min(float(u["ton"]), float(l["ton"]))
-        if step < eps:
-            if float(u["ton"]) < eps:
+        u_kg = int(u.get("tonKg") or 0)
+        l_kg = int(l.get("tonKg") or 0)
+        step_kg = min(u_kg, l_kg)
+        if step_kg <= 0:
+            if u_kg <= 0:
                 uq.popleft()
-            if float(l["ton"]) < eps:
+            if l_kg <= 0:
                 lq.popleft()
             continue
-        u_ton = float(u["ton"])
-        l_ton = float(l["ton"])
-        u_m2_step = float(u["m2"]) * (step / u_ton) if u_ton > eps else 0.0
-        l_m2_step = float(l["m2"]) * (step / l_ton) if l_ton > eps else 0.0
+        step_ton = _kg_int_to_ton(step_kg)
+        u_m2_step = float(u["m2"]) if step_kg == u_kg else float(u["m2PerKg"]) * step_kg
+        l_m2_step = float(l["m2"]) if step_kg == l_kg else float(l["m2PerKg"]) * step_kg
         cuts = [
             {
                 "orderId": oid,
                 "rollId": int(u["rollId"]),
-                "tonnage": round(step, 4),
+                "tonnage": round(step_ton, 4),
                 "m2": round(u_m2_step, 4),
-                "upperTonnage": round(step, 4),
+                "upperTonnage": round(step_ton, 4),
                 "lowerTonnage": 0.0,
             },
             {
                 "orderId": oid,
                 "rollId": int(l["rollId"]),
-                "tonnage": round(step, 4),
+                "tonnage": round(step_ton, 4),
                 "m2": round(l_m2_step, 4),
                 "upperTonnage": 0.0,
-                "lowerTonnage": round(step, 4),
+                "lowerTonnage": round(step_ton, 4),
             },
         ]
         steps.append({
@@ -662,13 +669,15 @@ def build_symmetric_steps_for_order(
             "lowerRollId": int(l["rollId"]),
             "cuts": cuts,
         })
-        u["ton"] = float(u["ton"]) - step
+        u["tonKg"] = u_kg - step_kg
+        u["ton"] = _kg_int_to_ton(int(u["tonKg"]))
         u["m2"] = float(u["m2"]) - u_m2_step
-        l["ton"] = float(l["ton"]) - step
+        l["tonKg"] = l_kg - step_kg
+        l["ton"] = _kg_int_to_ton(int(l["tonKg"]))
         l["m2"] = float(l["m2"]) - l_m2_step
-        if float(u["ton"]) < eps:
+        if float(u["ton"]) < eps or int(u["tonKg"]) <= 0:
             uq.popleft()
-        if float(l["ton"]) < eps:
+        if float(l["ton"]) < eps or int(l["tonKg"]) <= 0:
             lq.popleft()
     if uq or lq:
         logger.warning(
@@ -1523,12 +1532,23 @@ def solve_optimization(
     # rollId (indeks) tercih edilir — aynı toplam stok maliyetinde dar bobin (önce listelenen) öne geçer.
     roll_index_tie_eps = 1e-5
     roll_index_tie_term = roll_index_tie_eps * pulp.lpSum([(i + 1) * y[i] for i in I])
+    # Parçalanma azaltıcı bağ cezası: siparişi gereksiz çok rulo-dilimine bölmeyi zayıf tie-break ile caydırır.
+    # setup_cost rulonun açılmasını zaten fiyatlar; bu terim açık rulolar içinde "kaç farklı (rulo,sipariş) bağı"
+    # oluştuğunu küçültür ve tam/az parçalı eşleşmeleri öne taşır.
+    split_link_tie_eps = 1e-4
+    if dual_surface:
+        split_link_tie_term = split_link_tie_eps * pulp.lpSum(
+            [w_u[(i, j)] + w_l[(i, j)] for i in I for j in J]
+        )
+    else:
+        split_link_tie_term = split_link_tie_eps * pulp.lpSum([w[(i, j)] for i in I for j in J])
     model += (
         pulp.lpSum([F[i] * fire_cost for i in I]) +
         pulp.lpSum([R[i] * stock_cost for i in I]) +
         pulp.lpSum([y[i] * setup_cost for i in I]) +
         sync_penalty_term +
-        roll_index_tie_term,
+        roll_index_tie_term +
+        split_link_tie_term,
         "Toplam_Maliyet",
     )
     
