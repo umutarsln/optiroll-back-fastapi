@@ -369,6 +369,7 @@ def build_line_events(line_schedule: List[Dict]) -> Tuple[List[Dict], Dict[str, 
     total_changes = 0
     synchronous_changes = 0
     independent_changes = 0
+    cross_lane_transfers = 0
     for step_row in line_schedule:
         step = int(step_row["step"])
         oid = int(step_row["orderId"])
@@ -381,6 +382,15 @@ def build_line_events(line_schedule: List[Dict]) -> Tuple[List[Dict], Dict[str, 
             total_changes += int(upper_changed) + int(lower_changed)
             if upper_changed and lower_changed:
                 synchronous_changes += 1
+                # Aynı adımda hatlar arası çapraz taşıma: üstteki rulonun alta, alttakinin üste geçmesi.
+                if (
+                    prev_upper is not None
+                    and prev_lower is not None
+                    and upper_id == prev_lower
+                    and lower_id == prev_upper
+                    and upper_id != lower_id
+                ):
+                    cross_lane_transfers += 1
             else:
                 independent_changes += 1
 
@@ -425,6 +435,7 @@ def build_line_events(line_schedule: List[Dict]) -> Tuple[List[Dict], Dict[str, 
         "totalChanges": int(total_changes),
         "synchronousChanges": int(synchronous_changes),
         "independentChanges": int(independent_changes),
+        "crossLaneTransfers": int(cross_lane_transfers),
     }
     return line_events, summary
 
@@ -593,7 +604,7 @@ def _try_siki_ton_aligned_rows(
 def build_symmetric_steps_for_order(
     oid: int,
     order_rows: List[Dict],
-    sync_level: str = "dengeli",
+    sync_level: str = "serbest",
 ) -> List[Dict]:
     """
     Bir sipariş için üst/alt kuyrukları eş zamanlı tüketerek her adımda ust_ton == alt_ton olacak adımlar üretir.
@@ -685,7 +696,7 @@ def build_symmetric_steps_for_order(
 
 def build_symmetric_ops_by_order(
     cutting_plan: List[Dict],
-    sync_level: str = "dengeli",
+    sync_level: str = "serbest",
 ) -> Dict[int, List[Dict]]:
     """
     Kesim planından sipariş başına simetrik (ust==alt ton) atomik operasyon listesi üretir.
@@ -770,7 +781,7 @@ def _extract_legacy_index_pairing_ops(cutting_plan: List[Dict]) -> List[Dict]:
 
 def extract_atomic_operations(
     cutting_plan: List[Dict],
-    sync_level: str = "dengeli",
+    sync_level: str = "serbest",
 ) -> List[Dict]:
     """
     Kesim planından atomik hat adımlarını üretir (simetrik kuyruk; başarısızsa eski eşleme).
@@ -795,7 +806,7 @@ def _operation_transition_cost(op_a: Dict, op_b: Dict, sync_level: str) -> float
     Args:
         op_a: Önceki operasyon
         op_b: Sonraki operasyon
-        sync_level: serbest | dengeli | siki
+        sync_level: serbest | siki
 
     Returns:
         Skaler maliyet (MILP amaç katsayısı)
@@ -807,11 +818,18 @@ def _operation_transition_cost(op_a: Dict, op_b: Dict, sync_level: str) -> float
     cu = 1.0 if ua != ub else 0.0
     cl = 1.0 if la != lb else 0.0
     base = cu + cl
-    if sync_level == "dengeli":
-        base += 0.35 * abs(cu - cl)
-    elif sync_level == "siki":
+    if sync_level == "siki":
         if cu != cl:
             base += 2.5
+        # Çapraz hat transfer cezası: bir adımda üstte olan rulonun sonraki adımda alta geçmesi (ve tersi)
+        # operasyonel karmaşa ve ek setup etkisi yaratır; yasaklamak yerine güçlü ceza ile caydırılır.
+        cross_lane_transfers = 0
+        if ua is not None and ua == lb and ua != ub:
+            cross_lane_transfers += 1
+        if la is not None and la == ub and la != lb:
+            cross_lane_transfers += 1
+        if cross_lane_transfers > 0:
+            base += 3.0 * cross_lane_transfers
     order_penalty = 0.08 if int(op_a["orderId"]) != int(op_b["orderId"]) else 0.0
     return base + order_penalty
 
@@ -962,7 +980,7 @@ def _total_transition_cost(seq: List[int], ops: List[Dict], sync_level: str) -> 
     Args:
         seq: ops indekslerinin üretim sırası
         ops: Operasyon listesi
-        sync_level: serbest | dengeli | siki
+        sync_level: serbest | siki
 
     Returns:
         Toplam geçiş maliyeti
@@ -1370,7 +1388,7 @@ def enrich_line_schedule_with_actions(ordered_ops: List[Dict]) -> List[Dict]:
 
 def schedule_production_steps(
     cutting_plan: List[Dict],
-    sync_level: str = "dengeli",
+    sync_level: str = "serbest",
     time_limit_seconds: int = 45,
 ) -> List[Dict]:
     """
@@ -1446,7 +1464,7 @@ def solve_optimization(
     max_interleaving_orders: int = 2,
     interleaving_penalty_cost: float = 0.0,
     enforce_surface_sync: bool = False,
-    sync_level: str = "dengeli",
+    sync_level: str = "serbest",
     sync_penalty_weight: float = 0.0,
     roll_open_mask: Optional[Sequence[bool]] = None,
 ) -> Tuple[str, Optional[Dict]]:
@@ -1460,7 +1478,7 @@ def solve_optimization(
     Siparişe dönüş sırası için araya giren sipariş üst sınırını aşan kesim sıralarına soft ceza eklenebilir.
     enforce_surface_sync=True ise çift yüzeyde her sipariş için üstte kullanılan rulo adedi ile altta kullanılan
     rulo adedi eşitlenir (sert kısıt).
-    sync_level='dengeli' ise üst/alt bağımsız değişim farklarına ceza eklenebilir.
+    sync_level='siki' ise üst/alt bağımsız değişim farklarına ceza eklenebilir.
     roll_open_mask: ``len(rolls)`` uzunluğunda dizi; ``False`` olan indeksteki rulolar açılamaz
     (``y[i]=0``). Karşılaştırma testlerinde yalnızca 6 t veya yalnızca 6,4 t aileleri için kullanılır.
     
@@ -1515,7 +1533,7 @@ def solve_optimization(
     
     # Amaç fonksiyonu
     sync_penalty_term = 0
-    if dual_surface and sync_level == "dengeli" and sync_penalty_weight > 0:
+    if dual_surface and sync_level == "siki" and sync_penalty_weight > 0:
         sync_penalty_term = pulp.lpSum([sync_diff[j] * sync_penalty_weight for j in J])
     # Beraberlik kırma: kullanılmayan rulolarda R≈S ile h*R toplamı hangi çiftin açıldığından
     # bağımsız kalabiliyor; CBC rastgele yüksek indeksli ruloları seçebilir. Küçük ε ile düşük
@@ -1637,7 +1655,7 @@ def solve_optimization(
                 pulp.lpSum([w_u[(i, j)] for i in I]) == pulp.lpSum([w_l[(i, j)] for i in I]),
                 f"SurfaceSync_RollCount_{j}",
             )
-    elif dual_surface and sync_level == "dengeli":
+    elif dual_surface and sync_level == "siki":
         for j in J:
             upper_count = pulp.lpSum([w_u[(i, j)] for i in I])
             lower_count = pulp.lpSum([w_l[(i, j)] for i in I])

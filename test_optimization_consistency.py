@@ -21,6 +21,8 @@ from optimizer import (
     build_roll_order_sequence,
     apply_sequence_local_improvement,
     MIN_STOCK_THRESHOLD_TON,
+    _operation_transition_cost,
+    build_line_events,
 )
 
 
@@ -894,6 +896,32 @@ class TestOptimizationConsistency(unittest.TestCase):
             if float(r.get("stock", 0) or 0) > 1e-6 or float(r.get("unusedRollTonnage", 0) or 0) > 1e-6
         )
         self.assertEqual(stock_roll_count, 1, "Eş maliyette stok daha az sayıda ruloda tutulmalı")
+
+    def test_siki_transition_penalizes_cross_lane_transfer(self):
+        """
+        Sıkı modda, aynı rulonun üstten alta (veya tersi) taşındığı çapraz geçiş serbest moda göre daha pahalı olmalı.
+        """
+        op_a = {"orderId": 1, "upperRollId": 3, "lowerRollId": 5}
+        op_b = {"orderId": 2, "upperRollId": 2, "lowerRollId": 3}  # rulo 3 üstten alta geçti
+        c_serbest = _operation_transition_cost(op_a, op_b, "serbest")
+        c_siki = _operation_transition_cost(op_a, op_b, "siki")
+        self.assertGreater(
+            c_siki,
+            c_serbest,
+            msg="Sıkı modda çapraz hat transferi ek maliyet üretmeli",
+        )
+
+    def test_line_events_reports_cross_lane_transfer_metric(self):
+        """
+        Hat özetinde çapraz hat transfer sayacı üretilmeli ve swap adımı doğru sayılmalı.
+        """
+        schedule = [
+            {"step": 1, "orderId": 1, "upperRollId": 3, "lowerRollId": 5},
+            {"step": 2, "orderId": 1, "upperRollId": 5, "lowerRollId": 3},
+        ]
+        _, summary = build_line_events(schedule)
+        self.assertIn("crossLaneTransfers", summary)
+        self.assertEqual(int(summary["crossLaneTransfers"]), 1)
 
 
 if __name__ == "__main__":

@@ -397,13 +397,14 @@ class ModeComparisonItem(BaseModel):
 class SyncComparisonItem(BaseModel):
     """Senkron seviye bazlı kısa karşılaştırma satırı."""
 
-    syncLevel: Literal["serbest", "dengeli", "siki"]
+    syncLevel: Literal["serbest", "siki"]
     status: str
     totalCost: Optional[float] = None
     totalFire: Optional[float] = None
     rollChangeCount: Optional[int] = None
     synchronousChanges: Optional[int] = None
     independentChanges: Optional[int] = None
+    crossLaneTransfers: Optional[int] = None
 
 
 class LineEventItem(BaseModel):
@@ -423,6 +424,7 @@ class LineTransitionsSummary(BaseModel):
     totalChanges: int = 0
     synchronousChanges: int = 0
     independentChanges: int = 0
+    crossLaneTransfers: int = 0
     stepCount: int = 0
 
 
@@ -467,7 +469,7 @@ class OptimizeResponse(BaseModel):
     selectedModesCount: int = 0
     comparisonEnabled: bool = False
     modeComparisons: List[ModeComparisonItem] = Field(default_factory=list)
-    selectedSyncLevels: List[Literal["serbest", "dengeli", "siki"]] = Field(default_factory=list)
+    selectedSyncLevels: List[Literal["serbest", "siki"]] = Field(default_factory=list)
     selectedSyncLevelsCount: int = 0
     syncComparisons: List[SyncComparisonItem] = Field(default_factory=list)
     lineEvents: List[LineEventItem] = Field(default_factory=list)
@@ -502,22 +504,23 @@ def _resolve_strategy_modes(request: OptimizeRequest) -> List[Literal["az", "ort
     return valid
 
 
-def _resolve_sync_levels(request: OptimizeRequest) -> List[Literal["serbest", "dengeli", "siki"]]:
+def _resolve_sync_levels(request: OptimizeRequest) -> List[Literal["serbest", "siki"]]:
     """
     İstekten çalıştırılacak senkron seviyelerini normalize eder.
     """
     requested = request.sync_levels or ([request.sync_level] if request.sync_level else [])
-    valid: List[Literal["serbest", "dengeli", "siki"]] = []
+    valid: List[Literal["serbest", "siki"]] = []
     seen = set()
     for level in requested:
-        if level in seen:
+        normalized: Literal["serbest", "siki"] = "serbest" if level == "dengeli" else level
+        if normalized in seen:
             continue
-        seen.add(level)
-        valid.append(level)
+        seen.add(normalized)
+        valid.append(normalized)
     return valid
 
 
-def _build_sync_profile(level: Literal["serbest", "dengeli", "siki"]) -> Dict[str, float | int | bool | str]:
+def _build_sync_profile(level: Literal["serbest", "siki"]) -> Dict[str, float | int | bool | str]:
     """
     Senkron seviyesine göre çözücü ayarlarını döner.
     """
@@ -525,13 +528,7 @@ def _build_sync_profile(level: Literal["serbest", "dengeli", "siki"]) -> Dict[st
         return {
             "sync_level": "siki",
             "enforce_surface_sync": True,
-            "sync_penalty_weight": 0.0,
-        }
-    if level == "dengeli":
-        return {
-            "sync_level": "dengeli",
-            "enforce_surface_sync": False,
-            "sync_penalty_weight": 45.0,
+            "sync_penalty_weight": 55.0,
         }
     return {
         "sync_level": "serbest",
@@ -541,7 +538,7 @@ def _build_sync_profile(level: Literal["serbest", "dengeli", "siki"]) -> Dict[st
 
 
 def _build_sync_comparison_item(
-    level: Literal["serbest", "dengeli", "siki"],
+    level: Literal["serbest", "siki"],
     status: str,
     results: Optional[Dict],
 ) -> SyncComparisonItem:
@@ -560,7 +557,43 @@ def _build_sync_comparison_item(
         rollChangeCount=int(summary.get("rollChangeCount", 0) or 0),
         synchronousChanges=int(trans.get("synchronousChanges", 0) or 0),
         independentChanges=int(trans.get("independentChanges", 0) or 0),
+        crossLaneTransfers=int(trans.get("crossLaneTransfers", 0) or 0),
     )
+
+
+def _pick_low_cost_sync_result(
+    items: List[Tuple[Literal["serbest", "siki"], str, Optional[Dict]]],
+    margin_ratio: float = 0.02,
+) -> Optional[Tuple[Literal["serbest", "siki"], str, Optional[Dict]]]:
+    """
+    Senkron seviye sonuçlarından toplam maliyeti en düşük olanı seçer.
+    Maliyet farkı marj içindeyse line transition kalitesiyle tie-break uygular.
+    """
+    optimal = [it for it in items if it[1] == "Optimal" and it[2] is not None]
+    if not optimal:
+        return None
+    costs = [float((it[2] or {}).get("summary", {}).get("totalCost", float("inf"))) for it in optimal]
+    min_cost = min(costs)
+    limit = min_cost * (1.0 + max(0.0, margin_ratio))
+    near = [
+        it
+        for it in optimal
+        if float((it[2] or {}).get("summary", {}).get("totalCost", float("inf"))) <= limit
+    ]
+    if len(near) == 1:
+        return near[0]
+
+    def tie_key(it: Tuple[Literal["serbest", "siki"], str, Optional[Dict]]) -> Tuple[float, int, int, int]:
+        res = it[2] or {}
+        summary = res.get("summary") or {}
+        trans = res.get("lineTransitionsSummary") or {}
+        total_cost = float(summary.get("totalCost", float("inf")) or float("inf"))
+        cross = int(trans.get("crossLaneTransfers", 0) or 0)
+        indep = int(trans.get("independentChanges", 0) or 0)
+        changes = int(trans.get("totalChanges", 0) or 0)
+        return (total_cost, cross, indep, changes)
+
+    return min(near, key=tie_key)
 
 
 def _build_mode_profile(
@@ -784,7 +817,7 @@ async def optimize(request: OptimizeRequest):
 
         # Senkron seviyeleri için karşılaştırma (mod seçiminden bağımsız baz profil: orta).
         anchor_profile = _build_mode_profile("orta", request)
-        sync_status_results: List[Tuple[Literal["serbest", "dengeli", "siki"], str, Optional[Dict]]] = []
+        sync_status_results: List[Tuple[Literal["serbest", "siki"], str, Optional[Dict]]] = []
         sync_comparisons: List[SyncComparisonItem] = []
         for level in selected_sync_levels:
             sync_profile = _build_sync_profile(level)
@@ -812,19 +845,13 @@ async def optimize(request: OptimizeRequest):
             sync_status_results.append((level, status, results))
             sync_comparisons.append(_build_sync_comparison_item(level, status, results))
 
-        selected_sync: Optional[Tuple[Literal["serbest", "dengeli", "siki"], str, Optional[Dict]]] = None
-        for item in sync_status_results:
-            if item[0] == "dengeli" and item[1] == "Optimal" and item[2] is not None:
-                selected_sync = item
-                break
-        if selected_sync is None:
-            for item in sync_status_results:
-                if item[1] == "Optimal" and item[2] is not None:
-                    selected_sync = item
-                    break
+        selected_sync: Optional[Tuple[Literal["serbest", "siki"], str, Optional[Dict]]] = _pick_low_cost_sync_result(
+            sync_status_results,
+            margin_ratio=0.02,
+        )
         if selected_sync is None:
             status = sync_status_results[0][1] if sync_status_results else "Infeasible"
-            fail_level = sync_status_results[0][0] if sync_status_results else "dengeli"
+            fail_level = sync_status_results[0][0] if sync_status_results else "serbest"
             sp = _build_sync_profile(fail_level)
             code, _ = classify_infeasible_structure(
                 rolls=rolls,
