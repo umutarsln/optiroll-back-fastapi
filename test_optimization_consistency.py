@@ -836,6 +836,65 @@ class TestOptimizationConsistency(unittest.TestCase):
             "S2 için en az bir 800 m² tam eşleşme dilimi görünmeli",
         )
 
+    def test_demand_keeps_exact_m2_without_panel_round_overshoot(self):
+        """
+        Talep hesabı panel sayısına yuvarlanıp büyütülmemeli; 800 m² sipariş 800 m² kalmalı.
+        """
+        orders = _make_orders([800], panel_width=1.0, panel_length=3.0)
+        demand, _ = calculate_demand(
+            orders=orders,
+            thickness=0.75,
+            density=7.85,
+            panel_widths=[1.0],
+            panel_lengths=[3.0],
+            surface_factor=2.0,
+        )
+        rho = (0.75 / 1000.0) * 7.85
+        expected_ton = 800.0 * 2.0 * rho
+        self.assertAlmostEqual(
+            float(demand[0]),
+            round(expected_ton, 4),
+            places=4,
+            msg="Talep tonajı panel yuvarlama nedeniyle artmamalı",
+        )
+
+    def test_equal_stock_tie_prefers_fewer_stock_rolls(self):
+        """
+        Eş stok tonajı/maliyet senaryosunda, çözüm daha az sayıda stok rulosu üreten seçeneği tercih etmeli.
+        800 m² siparişte 1200'lük rulodan kesmek yerine 800'lük rulodan kesim beklenir.
+        """
+        orders = _make_orders([800], panel_width=1.0, panel_length=1.0)
+        rolls = [7.065, 4.71]  # 1200 m² ve 800 m² eşdeğeri
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=[1.0],
+            panel_lengths=[1.0],
+            rolls=rolls,
+            max_orders_per_roll=2,
+            max_rolls_per_order=2,
+            fire_cost=450,
+            setup_cost=120,
+            stock_cost=2.5,
+            time_limit_seconds=30,
+            surface_factor=1.0,
+        )
+        self.assertEqual(status, "Optimal")
+        cutting_plan = results["cuttingPlan"]
+        used_roll_ids = sorted({int(row["rollId"]) for row in cutting_plan if float(row.get("tonnage", 0) or 0) > 1e-6})
+        self.assertEqual(
+            used_roll_ids,
+            [2],
+            msg="800 m² siparişte tam eşleşen ikinci rulo kullanılmalı",
+        )
+        stock_roll_count = sum(
+            1
+            for r in results["rollStatus"]
+            if float(r.get("stock", 0) or 0) > 1e-6 or float(r.get("unusedRollTonnage", 0) or 0) > 1e-6
+        )
+        self.assertEqual(stock_roll_count, 1, "Eş maliyette stok daha az sayıda ruloda tutulmalı")
+
 
 if __name__ == "__main__":
     unittest.main()

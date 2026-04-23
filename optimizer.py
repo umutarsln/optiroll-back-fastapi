@@ -136,8 +136,8 @@ def calculate_demand(
     surface_factor: float = 1.0,
 ) -> Tuple[Dict, float]:
     """
-    Siparişleri ton'a çevir. Tam sayı panel kısıtı için m²'yi panele yuvarlar.
-    Panel = genişlik x uzunluk; kesim uzunluk ve katları şeklinde (örn. 3m → 3, 6, 9m).
+    Siparişleri ton'a çevir. Hedef m² doğrudan korunur; talep panel adedine yuvarlanarak
+    büyütülmez (ör. 800 m² sipariş, 801 m²'ye çıkmaz).
     
     Args:
         orders: Sipariş listesi (m2, panelWidth, panelLength)
@@ -152,14 +152,8 @@ def calculate_demand(
     """
     demand = {}
     for j, order in enumerate(orders):
-        pw = (panel_widths[j] if panel_widths is not None else order['panelWidth'])
-        pl = (panel_lengths[j] if panel_lengths is not None else order.get('panelLength', 1.0))
-        if pl <= 0:
-            pl = 1.0
-        # Tam sayı panel: m² / (genişlik * uzunluk) → 3*33+1 fire örneği gibi
-        panel_count = round(order['m2'] / (pw * pl)) if (pw * pl) > 0 else 0
-        panel_count = max(1, panel_count)
-        m2_eff = panel_count * pw * pl * max(1.0, float(surface_factor))
+        target_m2 = max(0.0, float(order.get('m2', 0.0) or 0.0))
+        m2_eff = target_m2 * max(1.0, float(surface_factor))
         demand[j] = round(m2_eff * (thickness / 1000) * density, 4)
     
     total_tonnage = sum(demand.values())
@@ -1487,15 +1481,11 @@ def solve_optimization(
     # Rulo tonajları
     S = {i: rolls[i] for i in I}
     
-    # Talep miktarları (tam sayı panel: m² / (genişlik * uzunluk))
+    # Talep miktarları: sipariş m² doğrudan korunur; panel adedine yuvarlayıp overshoot edilmez.
     talep_m2 = {}
     for j in J:
-        pw = panel_widths[j]
-        pl = panel_lengths[j] if j < len(panel_lengths) else 1.0
-        if pl <= 0:
-            pl = 1.0
-        panel_count = max(1, round(orders[j]['m2'] / (pw * pl))) if (pw * pl) > 0 else 1
-        talep_m2[j] = panel_count * pw * pl * max(1.0, float(surface_factor))
+        target_m2 = max(0.0, float(orders[j].get('m2', 0.0) or 0.0))
+        talep_m2[j] = target_m2 * max(1.0, float(surface_factor))
     D = {j: round(talep_m2[j] * (thickness / 1000) * density, 4) for j in J}
     dual_surface = float(surface_factor) >= 2.0 - 1e-12
     D_half = {j: D[j] / 2.0 for j in J} if dual_surface else {}
@@ -1542,13 +1532,19 @@ def solve_optimization(
         )
     else:
         split_link_tie_term = split_link_tie_eps * pulp.lpSum([w[(i, j)] for i in I for j in J])
+    # Eş maliyette stok tonajı aynı kalıyorsa, stokun daha az fiziksel rulo üzerinde tutulmasını tercih et.
+    # b[i]=1 olan rulo, stok taşıyan rulodur (açılmamış rulolar dahil); bu terim 2 rulo yerine 1 rulo stok
+    # gibi daha operasyonel seçeneği öne taşır.
+    stock_roll_count_tie_eps = 5e-5
+    stock_roll_count_tie_term = stock_roll_count_tie_eps * pulp.lpSum([b[i] for i in I])
     model += (
         pulp.lpSum([F[i] * fire_cost for i in I]) +
         pulp.lpSum([R[i] * stock_cost for i in I]) +
         pulp.lpSum([y[i] * setup_cost for i in I]) +
         sync_penalty_term +
         roll_index_tie_term +
-        split_link_tie_term,
+        split_link_tie_term +
+        stock_roll_count_tie_term,
         "Toplam_Maliyet",
     )
     
