@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Any, List, Dict, Optional, Literal, Tuple
 import uuid
 import os
+import math
 from optimizer import (
     generate_rolls,
     calculate_demand,
@@ -477,6 +478,34 @@ class OptimizeResponse(BaseModel):
     lineTransitionsSummary: LineTransitionsSummary = Field(default_factory=LineTransitionsSummary)
 
 
+def _validate_order_area_divisibility_or_raise(
+    m2: float,
+    panel_width: float,
+    panel_length: float,
+    *,
+    prefix: str = "Sipariş",
+) -> None:
+    """
+    m² değerinin panel alanına tam bölünebilirliğini doğrular.
+    """
+    area = float(panel_width) * float(panel_length)
+    if area <= 0:
+        return
+    exact = float(m2) / area
+    nearest = round(exact)
+    if abs(exact - nearest) < 1e-9:
+        return
+    floor_m2 = math.floor(exact) * area
+    ceil_m2 = math.ceil(exact) * area
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"{prefix}: m² panel alanına tam bölünmelidir. "
+            f"En yakın değerler: {floor_m2:.6f} m² veya {ceil_m2:.6f} m²."
+        ),
+    )
+
+
 @app.get("/")
 async def root():
     """API root endpoint"""
@@ -788,6 +817,12 @@ async def optimize(request: OptimizeRequest):
             if panel_lengths[j] <= 0:
                 detail = f"Sipariş {j+1} için panel uzunluğu 0'dan büyük olmalıdır"
                 raise HTTPException(status_code=400, detail=detail)
+            _validate_order_area_divisibility_or_raise(
+                m2=float(order.m2),
+                panel_width=float(order.panelWidth),
+                panel_length=float(panel_lengths[j]),
+                prefix=f"Sipariş {j+1}",
+            )
         
         # Talep hesaplama (panel uzunluğu ile: m² / (genişlik * uzunluk) = tam sayı panel)
         orders_list = [{"m2": o.m2, "panelWidth": o.panelWidth, "panelLength": panel_lengths[i]} for i, o in enumerate(request.orders)]
@@ -1210,6 +1245,12 @@ async def create_customer_request_endpoint(body: CustomerRequestCreate, request:
         raise HTTPException(status_code=400, detail="Panel genişliği 0'dan büyük olmalıdır")
     if body.panel_length <= 0:
         raise HTTPException(status_code=400, detail="Panel uzunluğu 0'dan büyük olmalıdır")
+    _validate_order_area_divisibility_or_raise(
+        m2=float(body.m2),
+        panel_width=float(body.panel_width),
+        panel_length=float(body.panel_length),
+        prefix="Müşteri talebi",
+    )
     try:
         row = insert_customer_request(
             firma_adi=body.firma_adi,
@@ -1278,6 +1319,12 @@ async def convert_customer_request_endpoint(request_id: str, body: OrderCreateUp
         raise HTTPException(status_code=400, detail="Panel genişliği 0'dan büyük olmalıdır")
     if (body.panel_length or 1) <= 0:
         raise HTTPException(status_code=400, detail="Panel uzunluğu 0'dan büyük olmalıdır")
+    _validate_order_area_divisibility_or_raise(
+        m2=float(body.m2),
+        panel_width=float(body.panel_width),
+        panel_length=float(body.panel_length or 1.0),
+        prefix="Talep dönüşümü",
+    )
     try:
         order_row = save_order(
             order_id=body.order_id.strip(),
@@ -1335,6 +1382,12 @@ async def upsert_order(request: OrderCreateUpdate):
         raise HTTPException(status_code=400, detail="Panel genişliği 0'dan büyük olmalıdır")
     if (request.panel_length or 1) <= 0:
         raise HTTPException(status_code=400, detail="Panel uzunluğu 0'dan büyük olmalıdır")
+    _validate_order_area_divisibility_or_raise(
+        m2=float(request.m2),
+        panel_width=float(request.panel_width),
+        panel_length=float(request.panel_length or 1.0),
+        prefix="Sipariş",
+    )
     try:
         return save_order(
             order_id=request.order_id,

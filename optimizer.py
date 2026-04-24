@@ -1496,17 +1496,19 @@ def solve_optimization(
     I = list(range(len(rolls)))
     J = list(range(len(orders)))
     
-    # Rulo tonajları
-    S = {i: rolls[i] for i in I}
+    # Rulo kapasitesi: çekirdekte kg-int defteri.
+    S_kg = {i: _ton_to_kg_int(rolls[i]) for i in I}
     
     # Talep miktarları: sipariş m² doğrudan korunur; panel adedine yuvarlayıp overshoot edilmez.
     talep_m2 = {}
     for j in J:
         target_m2 = max(0.0, float(orders[j].get('m2', 0.0) or 0.0))
         talep_m2[j] = target_m2 * max(1.0, float(surface_factor))
-    D = {j: round(talep_m2[j] * (thickness / 1000) * density, 4) for j in J}
+    rho_ton_per_m2 = (thickness / 1000) * density
+    rho_kg_per_m2 = rho_ton_per_m2 * 1000.0
+    D_kg = {j: _ton_to_kg_int(talep_m2[j] * rho_ton_per_m2) for j in J}
     dual_surface = float(surface_factor) >= 2.0 - 1e-12
-    D_half = {j: D[j] / 2.0 for j in J} if dual_surface else {}
+    D_half_kg = {j: D_kg[j] / 2.0 for j in J} if dual_surface else {}
 
     # Model oluştur
     model = pulp.LpProblem("Kesme_Stoku_Optimizasyonu", pulp.LpMinimize)
@@ -1556,8 +1558,8 @@ def solve_optimization(
     stock_roll_count_tie_eps = 5e-5
     stock_roll_count_tie_term = stock_roll_count_tie_eps * pulp.lpSum([b[i] for i in I])
     model += (
-        pulp.lpSum([F[i] * fire_cost for i in I]) +
-        pulp.lpSum([R[i] * stock_cost for i in I]) +
+        pulp.lpSum([F[i] * (fire_cost / 1000.0) for i in I]) +
+        pulp.lpSum([R[i] * (stock_cost / 1000.0) for i in I]) +
         pulp.lpSum([y[i] * setup_cost for i in I]) +
         sync_penalty_term +
         roll_index_tie_term +
@@ -1570,19 +1572,19 @@ def solve_optimization(
     for j in J:
         if dual_surface:
             model += (
-                pulp.lpSum([x_u[(i, j)] for i in I]) == D_half[j],
+                pulp.lpSum([x_u[(i, j)] for i in I]) == D_half_kg[j],
                 f"Talep_Ust_Yuzey_{j}",
             )
             model += (
-                pulp.lpSum([x_l[(i, j)] for i in I]) == D_half[j],
+                pulp.lpSum([x_l[(i, j)] for i in I]) == D_half_kg[j],
                 f"Talep_Alt_Yuzey_{j}",
             )
         else:
-            model += pulp.lpSum([x[(i, j)] for i in I]) == D[j], f"Talep_{j}"
+            model += pulp.lpSum([x[(i, j)] for i in I]) == D_kg[j], f"Talep_{j}"
 
     # Kapasite kısıtı
     for i in I:
-        model += u[i] <= S[i], f"Kapasite_{i}"
+        model += u[i] <= S_kg[i], f"Kapasite_{i}"
 
     # Kullanım tanımı (rulo i üzerindeki toplam ton = tüm sipariş ve yüzeyler)
     for i in I:
@@ -1597,26 +1599,26 @@ def solve_optimization(
 
     # Rulo kullanım tetikleyici
     for i in I:
-        model += u[i] <= S[i] * y[i], f"Rulo_Kullanim_{i}"
+        model += u[i] <= S_kg[i] * y[i], f"Rulo_Kullanim_{i}"
 
     # Setup / min lot: çift yüzeyde üst ve alt ayrı w ile bağlanır; aynı (i,j)’de en fazla bir yüzey.
-    min_demand = min(D.values()) if D else 0.5
-    min_lot = max(0.01, min(0.5, min_demand / 2))
+    min_demand_kg = min(D_kg.values()) if D_kg else 500
+    min_lot_kg = max(10, min(500, int(min_demand_kg / 2)))
     for i in I:
         for j in J:
             if dual_surface:
-                model += x_u[(i, j)] <= S[i] * w_u[(i, j)], f"Setup_U_{i}_{j}"
-                model += x_l[(i, j)] <= S[i] * w_l[(i, j)], f"Setup_L_{i}_{j}"
-                model += x_u[(i, j)] >= min_lot * w_u[(i, j)], f"Min_Lot_U_{i}_{j}"
-                model += x_l[(i, j)] >= min_lot * w_l[(i, j)], f"Min_Lot_L_{i}_{j}"
+                model += x_u[(i, j)] <= S_kg[i] * w_u[(i, j)], f"Setup_U_{i}_{j}"
+                model += x_l[(i, j)] <= S_kg[i] * w_l[(i, j)], f"Setup_L_{i}_{j}"
+                model += x_u[(i, j)] >= min_lot_kg * w_u[(i, j)], f"Min_Lot_U_{i}_{j}"
+                model += x_l[(i, j)] >= min_lot_kg * w_l[(i, j)], f"Min_Lot_L_{i}_{j}"
                 model += (
                     w_u[(i, j)] + w_l[(i, j)] <= 1,
                     f"Rulo_Siparis_Tek_Yuzey_{i}_{j}",
                 )
             else:
                 flow = x[(i, j)]
-                model += flow <= S[i] * w[(i, j)], f"Setup_{i}_{j}"
-                model += flow >= min_lot * w[(i, j)], f"Min_Lot_Size_{i}_{j}"
+                model += flow <= S_kg[i] * w[(i, j)], f"Setup_{i}_{j}"
+                model += flow >= min_lot_kg * w[(i, j)], f"Min_Lot_Size_{i}_{j}"
 
     # w / (w_u,w_l) ve y_i bağlantısı
     for i in I:
@@ -1676,28 +1678,28 @@ def solve_optimization(
 
     # Denge kısıtı
     for i in I:
-        model += R[i] + F[i] == S[i] - u[i], f"Denge_{i}"
+        model += R[i] + F[i] == S_kg[i] - u[i], f"Denge_{i}"
     
     # Stok/Fire ayrımı: R[i] >= EPS*b[i] ile b=1 iken R en az EPS olmalı.
     # EPS=0.01 sabitken kalan (S-u) < 0.01 t olduğunda b=1 ile dengeli değil; çözücü b=0 zorlar,
     # küçük kalanı tamamen F'ye yazar — yüksek cf ile dar bobin (5,89 t) dalı pahalı görünür.
-    s_min_cap = min(float(S[ii]) for ii in I) if I else 1.0
-    EPS = max(1e-7, min(0.01, s_min_cap * 1e-6, min_demand * 1e-6))
+    s_min_cap_kg = min(float(S_kg[ii]) for ii in I) if I else 1000.0
+    EPS = max(0.1, min(10.0, s_min_cap_kg * 1e-6, float(min_demand_kg) * 1e-6))
     for i in I:
-        model += R[i] <= S[i] * b[i], f"Stok_ust_{i}"
+        model += R[i] <= S_kg[i] * b[i], f"Stok_ust_{i}"
         model += R[i] >= EPS * b[i], f"Stok_alt_{i}"
-        model += F[i] <= S[i] * (1 - b[i]), f"Fire_ust_{i}"
+        model += F[i] <= S_kg[i] * (1 - b[i]), f"Fire_ust_{i}"
     # Açılmayan rulo (y=0): kesim firesi yok; bobin rafta → F=0, R=S−u ve h×R ile stok tutma (raporla uyum).
     for i in I:
-        model += F[i] <= S[i] * y[i], f"Fire_sadece_acilan_ruloda_{i}"
+        model += F[i] <= S_kg[i] * y[i], f"Fire_sadece_acilan_ruloda_{i}"
     # Rapor 0,5 t kuralı ile aynı: kalan (S−u) ≤ 0,5 ise b=0 (tamamı fire maliyeti cf), aksi halde b=1 (tamamı h).
     # Açılmayan ruloda (1−y) ile kısıtlar gevşetilir; y=0 iken F=0 zaten R=S zorlar.
-    s_max_cap = max((float(S[ii]) for ii in I), default=1.0)
-    M_rem = 2.0 * s_max_cap + 10.0
-    T_rem = float(MIN_STOCK_THRESHOLD_TON)
-    eps_rem = 1e-4
+    s_max_cap_kg = max((float(S_kg[ii]) for ii in I), default=1000.0)
+    M_rem = 2.0 * s_max_cap_kg + 10.0
+    T_rem = float(MIN_STOCK_THRESHOLD_KG)
+    eps_rem = 0.1
     for i in I:
-        rem_lin = S[i] - u[i]
+        rem_lin = S_kg[i] - u[i]
         model += (
             rem_lin <= T_rem + M_rem * b[i] + M_rem * (1 - y[i]),
             f"Rem_fire_stok_esik_ust_{i}",
@@ -1727,23 +1729,28 @@ def solve_optimization(
     if status != 'Optimal':
         return status, None
     
-    # Sonuçları çıkar (birim tonaj = bir panel: genişlik * uzunluk * kalınlık * yoğunluk)
+    # Sonuçları çıkar (iç model kg, API çıkışı ton/m²).
     cutting_plan = []
-    birim_tonaj = {
-        j: (panel_widths[j] * (panel_lengths[j] if j < len(panel_lengths) else 1.0) * (thickness / 1000) * density)
+    birim_kg = {
+        j: _ton_to_kg_int(
+            panel_widths[j]
+            * (panel_lengths[j] if j < len(panel_lengths) else 1.0)
+            * (thickness / 1000)
+            * density
+        )
         for j in J
     }
-    rho = (thickness / 1000) * density
     for i in I:
         for j in J:
             if dual_surface:
-                tu = float(pulp.value(x_u[(i, j)]) or 0.0)
-                tl = float(pulp.value(x_l[(i, j)]) or 0.0)
-                if tu <= 0.0001 and tl <= 0.0001:
+                tu_kg = max(0, int(round(float(pulp.value(x_u[(i, j)]) or 0.0))))
+                tl_kg = max(0, int(round(float(pulp.value(x_l[(i, j)]) or 0.0))))
+                if tu_kg <= 0 and tl_kg <= 0:
                     continue
-                miktar_ton = tu + tl
-                miktar_m2 = miktar_ton / rho if rho > 0 else 0.0
-                panel_count = int(round(miktar_ton / birim_tonaj[j])) if birim_tonaj[j] > 0 else 0
+                miktar_kg = tu_kg + tl_kg
+                miktar_ton = _kg_int_to_ton(miktar_kg)
+                miktar_m2 = (miktar_kg / rho_kg_per_m2) if rho_kg_per_m2 > 0 else 0.0
+                panel_count = int(round(miktar_kg / birim_kg[j])) if birim_kg[j] > 0 else 0
                 pl = panel_lengths[j] if j < len(panel_lengths) else 1.0
                 cutting_plan.append({
                     "rollId": i + 1,
@@ -1752,15 +1759,17 @@ def solve_optimization(
                     "panelWidth": panel_widths[j],
                     "panelLength": pl,
                     "tonnage": round(miktar_ton, 4),
-                    "upperTonnage": round(tu, 4),
-                    "lowerTonnage": round(tl, 4),
+                    "upperTonnage": round(_kg_int_to_ton(tu_kg), 4),
+                    "lowerTonnage": round(_kg_int_to_ton(tl_kg), 4),
                     "m2": round(miktar_m2, 2),
                 })
             else:
-                if pulp.value(x[(i, j)]) > 0.0001:
-                    miktar_ton = pulp.value(x[(i, j)])
-                    miktar_m2 = miktar_ton / rho if rho > 0 else 0.0
-                    panel_count = int(round(miktar_ton / birim_tonaj[j])) if birim_tonaj[j] > 0 else 0
+                x_val = float(pulp.value(x[(i, j)]) or 0.0)
+                miktar_kg = max(0, int(round(x_val)))
+                if miktar_kg > 0:
+                    miktar_ton = _kg_int_to_ton(miktar_kg)
+                    miktar_m2 = (miktar_kg / rho_kg_per_m2) if rho_kg_per_m2 > 0 else 0.0
+                    panel_count = int(round(miktar_kg / birim_kg[j])) if birim_kg[j] > 0 else 0
                     pl = panel_lengths[j] if j < len(panel_lengths) else 1.0
                     cutting_plan.append({
                         "rollId": i + 1,
@@ -1789,24 +1798,23 @@ def solve_optimization(
 
     roll_status = []
     for i in I:
-        kullanilan = pulp.value(u[i])
-        fire = pulp.value(F[i])
-        stok = pulp.value(R[i])
+        kullanilan = _kg_int_to_ton(int(round(float(pulp.value(u[i]) or 0.0))))
+        fire = _kg_int_to_ton(int(round(float(pulp.value(F[i]) or 0.0))))
+        stok = _kg_int_to_ton(int(round(float(pulp.value(R[i]) or 0.0))))
         if dual_surface:
             kullanilan_siparis = sum(
                 1
                 for j in J
-                if float(pulp.value(x_u[(i, j)]) or 0.0) + float(pulp.value(x_l[(i, j)]) or 0.0)
-                > 0.0001
+                if float(pulp.value(x_u[(i, j)]) or 0.0) + float(pulp.value(x_l[(i, j)]) or 0.0) > 0.5
             )
         else:
-            kullanilan_siparis = sum([1 for j in J if pulp.value(x[(i, j)]) > 0.0001])
+            kullanilan_siparis = sum([1 for j in J if float(pulp.value(x[(i, j)]) or 0.0) > 0.5])
         
         roll_status.append({
             "rollId": i + 1,
-            "totalTonnage": S[i],
+            "totalTonnage": _kg_int_to_ton(S_kg[i]),
             "used": round(kullanilan, 4),
-            "remaining": round(S[i] - kullanilan, 4),
+            "remaining": round(_kg_int_to_ton(S_kg[i]) - kullanilan, 4),
             "fire": round(fire, 4),
             "stock": round(stok, 4),
             "ordersUsed": kullanilan_siparis,
@@ -1821,7 +1829,7 @@ def solve_optimization(
     toplam_eldeki_kg = 0
     for idx, i in enumerate(I):
         item = roll_status[idx]
-        cap_kg = _ton_to_kg_int(float(S[i]))
+        cap_kg = int(S_kg[i])
         cap_ton = _kg_int_to_ton(cap_kg)
         y_val = float(pulp.value(y[i]) or 0.0)
         if y_val <= 0.5:
@@ -1932,8 +1940,10 @@ def solve_optimization(
         "data": {
             "I": I,
             "J": J,
-            "S": S,
-            "D": D,
+            "S": {i: _kg_int_to_ton(S_kg[i]) for i in I},
+            "Skg": dict(S_kg),
+            "D": {j: _kg_int_to_ton(D_kg[j]) for j in J},
+            "Dkg": dict(D_kg),
             "panel_widths": panel_widths,
             "panel_lengths": panel_lengths,
             "orders": orders,

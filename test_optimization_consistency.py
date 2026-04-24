@@ -923,6 +923,92 @@ class TestOptimizationConsistency(unittest.TestCase):
         self.assertIn("crossLaneTransfers", summary)
         self.assertEqual(int(summary["crossLaneTransfers"]), 1)
 
+    def test_integer_kg_flow_no_upper_lower_drift_on_given_2500m2_case(self):
+        """
+        Verilen 2500 m² senaryosunda adım bazında üst/alt tonaj ayrışması oluşmamalı.
+        """
+        orders = _make_orders([2500], panel_width=1.0, panel_length=1.0)
+        rolls = [11.775, 8.831, 8.831, 5.888]
+        status, results = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=[1.0],
+            panel_lengths=[1.0],
+            rolls=rolls,
+            max_orders_per_roll=5,
+            max_rolls_per_order=5,
+            fire_cost=100,
+            setup_cost=120,
+            stock_cost=200000,
+            time_limit_seconds=45,
+            surface_factor=2.0,
+            sync_level="siki",
+        )
+        self.assertEqual(status, "Optimal")
+        for step in results.get("lineSchedule", []):
+            cuts = step.get("cuts", [])
+            if len(cuts) != 2:
+                continue
+            self.assertAlmostEqual(
+                float(cuts[0].get("tonnage", 0.0) or 0.0),
+                float(cuts[1].get("tonnage", 0.0) or 0.0),
+                places=4,
+                msg=f"Adım {step.get('step')}: üst/alt tonaj eşit olmalı",
+            )
+
+    def test_siki_has_at_least_serbest_synchronous_changes_on_given_case(self):
+        """
+        Verilen senaryoda sıkı modun eşzamanlı değişim sayısı serbest moddan az olmamalı.
+        """
+        orders = _make_orders([2500], panel_width=1.0, panel_length=1.0)
+        rolls = [11.775, 8.831, 8.831, 5.888]
+
+        status_serbest, res_serbest = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=[1.0],
+            panel_lengths=[1.0],
+            rolls=rolls,
+            max_orders_per_roll=5,
+            max_rolls_per_order=5,
+            fire_cost=100,
+            setup_cost=120,
+            stock_cost=200000,
+            time_limit_seconds=45,
+            surface_factor=2.0,
+            sync_level="serbest",
+            enforce_surface_sync=False,
+        )
+        status_siki, res_siki = solve_optimization(
+            thickness=0.75,
+            density=7.85,
+            orders=orders,
+            panel_widths=[1.0],
+            panel_lengths=[1.0],
+            rolls=rolls,
+            max_orders_per_roll=5,
+            max_rolls_per_order=5,
+            fire_cost=100,
+            setup_cost=120,
+            stock_cost=200000,
+            time_limit_seconds=45,
+            surface_factor=2.0,
+            sync_level="siki",
+            enforce_surface_sync=True,
+        )
+        self.assertEqual(status_serbest, "Optimal")
+        self.assertEqual(status_siki, "Optimal")
+
+        serbest_sync = int((res_serbest.get("lineTransitionsSummary") or {}).get("synchronousChanges", 0) or 0)
+        siki_sync = int((res_siki.get("lineTransitionsSummary") or {}).get("synchronousChanges", 0) or 0)
+        self.assertGreaterEqual(
+            siki_sync,
+            serbest_sync,
+            msg="Sıkı mod eşzamanlı değişimde serbestin gerisine düşmemeli",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
